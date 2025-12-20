@@ -187,46 +187,6 @@ class SymbolFilter {
     return [];
   }
 
-  async getOIForSymbols(symbols) {
-    console.log('[FILTER] Fetching OI data...');
-    const symbolsWithOI = [];
-
-    for (let i = 0; i < symbols.length; i++) {
-      const symbol = symbols[i].symbol;
-      
-      try {
-        const response = await axios.get(`${CONFIG.MEXC_API}/detail`, {
-          params: { symbol },
-          timeout: 3000
-        });
-
-        if (response.data && response.data.data) {
-          const oi = parseFloat(response.data.data.openInterest) || 0;
-          const oiValue = oi * symbols[i].lastPrice;
-          
-          if (oiValue > 0) {
-            symbolsWithOI.push({
-              ...symbols[i],
-              oi: oiValue
-            });
-          }
-        }
-      } catch (error) {
-        // Skip on error
-      }
-
-      // Progress
-      if ((i + 1) % 50 === 0) {
-        console.log(`[FILTER] OI progress: ${i + 1}/${symbols.length}`);
-      }
-
-      await new Promise(r => setTimeout(r, 100));
-    }
-
-    console.log(`[FILTER] Got OI for ${symbolsWithOI.length} symbols`);
-    return symbolsWithOI;
-  }
-
   async getMarketCapsFromCoinGecko(mappedSymbols) {
     console.log('[FILTER] Fetching market caps from CoinGecko...');
     const symbolsWithMC = [];
@@ -302,35 +262,45 @@ class SymbolFilter {
       // 1. Get all symbols from MEXC
       const allSymbols = await this.fetchAllSymbolsFromMEXC();
       if (allSymbols.length === 0) return [];
-
-      // 2. Get OI for symbols
-      const symbolsWithOI = await this.getOIForSymbols(allSymbols);
-      if (symbolsWithOI.length === 0) return [];
-
-      // 3. Map to CoinGecko IDs
-      const symbolsToMap = symbolsWithOI.map(s => s.symbol);
+  
+      console.log(`[FILTER] Processing ${allSymbols.length} symbols for MC filtering...`);
+  
+      // 2. Map to CoinGecko IDs (всі, не тільки топ-100)
+      const symbolsToMap = allSymbols.map(s => s.symbol);
       const mapped = await this.symbolMapper.batchMapSymbols(symbolsToMap);
       
-      // Merge data
-      const symbolsWithMapping = symbolsWithOI
+      // 3. Merge mapping
+      const symbolsWithMapping = allSymbols
         .map(s => {
           const mapping = mapped.find(m => m.symbol === s.symbol);
           return mapping ? { ...s, coinId: mapping.coinId } : null;
         })
         .filter(s => s !== null);
-
+  
       if (symbolsWithMapping.length === 0) return [];
-
+  
       // 4. Get market caps
       const symbolsWithMC = await this.getMarketCapsFromCoinGecko(symbolsWithMapping);
-
-      // 5. Filter by OI/MC
-      const filtered = this.filterByOIMC(symbolsWithMC);
-
+  
+      // 5. Filter ONLY by MC (20M - 150M)
+      const filtered = symbolsWithMC.filter(s => {
+        const mc = s.marketCap;
+        const passedMC = mc >= CONFIG.MIN_MARKET_CAP && mc <= CONFIG.MAX_MARKET_CAP;
+        
+        if (passedMC) {
+          console.log(`[FILTER] ✅ ${s.symbol} | MC: $${(mc/1e6).toFixed(1)}M | Vol: $${(s.volume24/1e6).toFixed(1)}M`);
+        }
+        return passedMC;
+      });
+  
+      // Sort by volume (most active first)
+      filtered.sort((a, b) => b.volume24 - a.volume24);
+  
+      console.log(`[FILTER] Final result: ${filtered.length} symbols in MC range 20-150M`);
       return filtered.map(s => s.symbol);
       
     } catch (error) {
-      console.error('[FILTER] Error in filtering process:', error.message);
+      console.error('[FILTER] Error:', error.message);
       return [];
     }
   }
