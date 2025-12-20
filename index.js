@@ -501,26 +501,25 @@ class MEXCWebSocketListener {
   }
 
   async subscribeToAllSymbols() {
-    console.log('\n[INIT] Subscribing to all symbols for OI tracking...');
+    console.log('\n[INIT] Getting all symbols from MEXC...');
     
-    // Subscribe to deal (trades) + detail (OI, funding) for all symbols
-    // We'll filter later based on OI
+    // Один REST запит на старті - отримати всі символи
+    const axios = require('axios');
+    const res = await axios.get('https://contract.mexc.com/api/v1/contract/ticker');
     
-    // Get list of all symbols (simplified - subscribe to pattern)
-    // MEXC supports wildcard subscriptions
+    const allSymbols = res.data.data
+      .filter(s => s.symbol && s.symbol.includes('_USDT'))
+      .map(s => s.symbol);
     
-    // For now, subscribe to popular symbols initially
-    const initialSymbols = [
-      'BTC_USDT', 'ETH_USDT', 'SOL_USDT', 'BNB_USDT', 'XRP_USDT',
-      'ADA_USDT', 'DOGE_USDT', 'AVAX_USDT', 'MATIC_USDT', 'DOT_USDT',
-      'TRX_USDT', 'LINK_USDT', 'UNI_USDT', 'ATOM_USDT', 'LTC_USDT'
-    ];
+    console.log(`[INIT] Found ${allSymbols.length} symbols. Subscribing...`);
     
-    for (const symbol of initialSymbols) {
+    // Підписатися на ВСІ
+    for (const symbol of allSymbols) {
       this.subscribeToSymbol(symbol);
+      await new Promise(r => setTimeout(r, 50)); // delay
     }
     
-    console.log('[INIT] Initial subscriptions complete. Will discover more symbols via WS messages.\n');
+    console.log('[INIT] Subscriptions complete\n');
   }
 
   subscribeToSymbol(symbol) {
