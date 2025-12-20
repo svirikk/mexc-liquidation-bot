@@ -1,6 +1,6 @@
 // ============================================================================
-// MEXC FUTURES LIQUIDATION ALERT BOT - ENHANCED VERSION
-// WITH OI/MC FILTERING & COINGECKO INTEGRATION
+// MEXC FUTURES LIQUIDATION ALERT BOT - WebSocket Only Version
+// OI-based filtering, no REST API, no CoinGecko
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -9,32 +9,28 @@ if (process.env.NODE_ENV !== 'production') {
 
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
 const CONFIG = {
-  // Thresholds
+  // Alert thresholds
   MIN_VOLUME_USD: parseInt(process.env.MIN_VOLUME_USD) || 800000,
+  MIN_VOLUME_USD_LARGE: parseInt(process.env.MIN_VOLUME_USD_LARGE) || 1000000,
   MIN_DOMINANCE: parseInt(process.env.MIN_DOMINANCE) || 65,
   WINDOW_SECONDS: [30, 60, 120, 180],
   COOLDOWN_MINUTES: parseInt(process.env.COOLDOWN_MINUTES) || 20,
   
-  // Market Cap & OI/MC filters
-  MIN_MARKET_CAP: parseInt(process.env.MIN_MARKET_CAP) || 20_000_000,
-  MAX_MARKET_CAP: parseInt(process.env.MAX_MARKET_CAP) || 150_000_000,
-  MIN_VOLUME_24H: parseInt(process.env.MIN_VOLUME_24H) || 1_000_000,
+  // OI filtering (замість MC)
+  MIN_OPEN_INTEREST: parseInt(process.env.MIN_OPEN_INTEREST) || 10_000_000,
+  MAX_OPEN_INTEREST: parseInt(process.env.MAX_OPEN_INTEREST) || 50_000_000,
   
   // Refresh settings
-  REFRESH_SYMBOLS_HOURS: parseInt(process.env.REFRESH_SYMBOLS_HOURS) || 2,
+  REFRESH_SYMBOLS_MINUTES: parseInt(process.env.REFRESH_SYMBOLS_MINUTES) || 30,
   
-  // APIs
+  // WebSocket
   MEXC_WS: 'wss://contract.mexc.com/edge',
-  MEXC_API: 'https://contract.mexc.com/api/v1/contract',
-  COINGECKO_API: 'https://api.coingecko.com/api/v3',
-  COINGECKO_RATE_LIMIT_MS: 1500,
   
   // Telegram
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
@@ -42,270 +38,64 @@ const CONFIG = {
 };
 
 // ============================================================================
-// SYMBOL MAPPER (MEXC → CoinGecko)
+// OI TRACKER (Open Interest via WebSocket)
 // ============================================================================
 
-class SymbolMapper {
+class OITracker {
   constructor() {
-    this.cache = new Map(); // symbol -> coin_id
-    this.reverseCache = new Map(); // coin_id -> symbol
+    this.oiData = new Map(); // symbol -> { oi, lastPrice, fundingRate, timestamp }
   }
 
-  async mapSymbolToCoinGeckoId(mexcSymbol) {
-    // Check cache
-    if (this.cache.has(mexcSymbol)) {
-      return this.cache.get(mexcSymbol);
-    }
-
-    // Hardcoded popular mappings
-    const hardcoded = this.getHardcodedMapping(mexcSymbol);
-    if (hardcoded) {
-      this.cache.set(mexcSymbol, hardcoded);
-      return hardcoded;
-    }
-
-    // Search on CoinGecko
-    try {
-      const searchTerm = mexcSymbol.replace('_USDT', '').toLowerCase();
-      const response = await axios.get(`${CONFIG.COINGECKO_API}/search`, {
-        params: { query: searchTerm },
-        timeout: 5000
-      });
-
-      if (response.data && response.data.coins && response.data.coins.length > 0) {
-        // Find best match
-        const coin = response.data.coins.find(c => 
-          c.symbol.toLowerCase() === searchTerm ||
-          c.id.toLowerCase() === searchTerm
-        ) || response.data.coins[0];
-
-        this.cache.set(mexcSymbol, coin.id);
-        this.reverseCache.set(coin.id, mexcSymbol);
-        
-        return coin.id;
-      }
-    } catch (error) {
-      console.error(`[MAPPER] Error searching ${mexcSymbol}:`, error.message);
-    }
-
-    return null;
-  }
-
-  async batchMapSymbols(symbols) {
-    console.log(`[MAPPER] Mapping ${symbols.length} symbols...`);
-    const mapped = [];
-
-    for (let i = 0; i < symbols.length; i++) {
-      const symbol = symbols[i];
-      const coinId = await this.mapSymbolToCoinGeckoId(symbol);
-      
-      if (coinId) {
-        mapped.push({ symbol, coinId });
-      }
-
-      // Progress
-      if ((i + 1) % 50 === 0) {
-        console.log(`[MAPPER] Progress: ${i + 1}/${symbols.length}`);
-      }
-
-      // Rate limit
-      await new Promise(r => setTimeout(r, CONFIG.COINGECKO_RATE_LIMIT_MS));
-    }
-
-    console.log(`[MAPPER] Mapped ${mapped.length}/${symbols.length} symbols`);
-    return mapped;
-  }
-
-  getHardcodedMapping(symbol) {
-    const map = {
-      'BTC_USDT': 'bitcoin',
-      'ETH_USDT': 'ethereum',
-      'SOL_USDT': 'solana',
-      'BNB_USDT': 'binancecoin',
-      'XRP_USDT': 'ripple',
-      'ADA_USDT': 'cardano',
-      'DOGE_USDT': 'dogecoin',
-      'AVAX_USDT': 'avalanche-2',
-      'MATIC_USDT': 'matic-network',
-      'DOT_USDT': 'polkadot',
-      'TRX_USDT': 'tron',
-      'LINK_USDT': 'chainlink',
-      'UNI_USDT': 'uniswap',
-      'ATOM_USDT': 'cosmos',
-      'LTC_USDT': 'litecoin',
-      'ETC_USDT': 'ethereum-classic',
-      'BCH_USDT': 'bitcoin-cash',
-      'FIL_USDT': 'filecoin',
-      'APT_USDT': 'aptos',
-      'ARB_USDT': 'arbitrum',
-      'OP_USDT': 'optimism',
-      'SUI_USDT': 'sui',
-      'PEPE_USDT': 'pepe',
-      'SHIB_USDT': 'shiba-inu',
-      'WIF_USDT': 'dogwifcoin',
-      'BONK_USDT': 'bonk',
-    };
-    return map[symbol] || null;
-  }
-}
-
-// ============================================================================
-// SYMBOL FILTER (OI/MC filtering)
-// ============================================================================
-
-class SymbolFilter {
-  constructor(symbolMapper) {
-    this.symbolMapper = symbolMapper;
-  }
-
-  async fetchAllSymbolsFromMEXC() {
-    try {
-      console.log('[FILTER] Fetching all symbols from MEXC...');
-      const response = await axios.get(`${CONFIG.MEXC_API}/ticker`, {
-        timeout: 10000
-      });
-
-      if (response.data && response.data.data) {
-        const symbols = response.data.data
-          .filter(s => s.symbol && s.symbol.includes('_USDT'))
-          .filter(s => parseFloat(s.volume24 || 0) >= CONFIG.MIN_VOLUME_24H)
-          .map(s => ({
-            symbol: s.symbol,
-            volume24: parseFloat(s.volume24 || 0),
-            lastPrice: parseFloat(s.lastPrice || 0)
-          }))
-          .sort((a, b) => b.volume24 - a.volume24);
-
-        console.log(`[FILTER] Found ${symbols.length} symbols with volume > $${CONFIG.MIN_VOLUME_24H}`);
-        return symbols;
-      }
-    } catch (error) {
-      console.error('[FILTER] Error fetching symbols:', error.message);
-    }
-    return [];
-  }
-
-  async getMarketCapsFromCoinGecko(mappedSymbols) {
-    console.log('[FILTER] Fetching market caps from CoinGecko...');
-    const symbolsWithMC = [];
-
-    // Batch request (250 IDs per request)
-    const batchSize = 250;
-    for (let i = 0; i < mappedSymbols.length; i += batchSize) {
-      const batch = mappedSymbols.slice(i, i + batchSize);
-      const coinIds = batch.map(s => s.coinId).join(',');
-
-      try {
-        const response = await axios.get(`${CONFIG.COINGECKO_API}/coins/markets`, {
-          params: {
-            vs_currency: 'usd',
-            ids: coinIds,
-            per_page: 250,
-            page: 1
-          },
-          timeout: 10000
-        });
-
-        if (response.data) {
-          for (const coinData of response.data) {
-            const mappedSymbol = batch.find(s => s.coinId === coinData.id);
-            if (mappedSymbol && coinData.market_cap) {
-              symbolsWithMC.push({
-                ...mappedSymbol,
-                marketCap: coinData.market_cap
-              });
-            }
-          }
-        }
-
-        console.log(`[FILTER] MC progress: ${Math.min(i + batchSize, mappedSymbols.length)}/${mappedSymbols.length}`);
-        await new Promise(r => setTimeout(r, CONFIG.COINGECKO_RATE_LIMIT_MS));
-        
-      } catch (error) {
-        console.error(`[FILTER] Error fetching MC batch:`, error.message);
-      }
-    }
-
-    console.log(`[FILTER] Got market cap for ${symbolsWithMC.length} symbols`);
-    return symbolsWithMC;
-  }
-
-  filterByOIMC(symbolsWithData) {
-    console.log('[FILTER] Applying OI/MC filter...');
-    
-    const filtered = symbolsWithData.filter(s => {
-      const mc = s.marketCap;
-      const oi = s.oi;
-      const ratio = oi / mc;
-
-      const passedMC = mc >= CONFIG.MIN_MARKET_CAP && mc <= CONFIG.MAX_MARKET_CAP;
-      const passedRatio = ratio >= CONFIG.MIN_OI_MC_RATIO && ratio <= CONFIG.MAX_OI_MC_RATIO;
-
-      if (passedMC && passedRatio) {
-        console.log(`[FILTER] ✅ ${s.symbol} | MC: $${(mc/1e6).toFixed(1)}M | OI: $${(oi/1e6).toFixed(1)}M | Ratio: ${ratio.toFixed(2)}`);
-      }
-
-      return passedMC && passedRatio;
+  updateOI(symbol, oi, lastPrice, fundingRate) {
+    this.oiData.set(symbol, {
+      oi,
+      lastPrice,
+      fundingRate,
+      timestamp: Date.now()
     });
+  }
 
-    // Sort by OI/MC ratio (most speculative first)
-    filtered.sort((a, b) => (b.oi / b.marketCap) - (a.oi / a.marketCap));
+  getOI(symbol) {
+    return this.oiData.get(symbol);
+  }
 
-    console.log(`[FILTER] Final result: ${filtered.length} symbols passed filter`);
+  getFilteredSymbols() {
+    const filtered = [];
+    
+    for (const [symbol, data] of this.oiData.entries()) {
+      const oiValue = data.oi * data.lastPrice;
+      
+      if (oiValue >= CONFIG.MIN_OPEN_INTEREST && 
+          oiValue <= CONFIG.MAX_OPEN_INTEREST) {
+        filtered.push({
+          symbol,
+          oiValue,
+          lastPrice: data.lastPrice,
+          fundingRate: data.fundingRate
+        });
+      }
+    }
+
+    // Sort by OI
+    filtered.sort((a, b) => b.oiValue - a.oiValue);
+    
     return filtered;
   }
 
-  async getFilteredSymbols() {
-    try {
-      // 1. Get all symbols from MEXC
-      const allSymbols = await this.fetchAllSymbolsFromMEXC();
-      if (allSymbols.length === 0) return [];
-  
-      console.log(`[FILTER] Processing ${allSymbols.length} symbols for MC filtering...`);
-  
-      // 2. Map to CoinGecko IDs (всі, не тільки топ-100)
-      const symbolsToMap = allSymbols.map(s => s.symbol);
-      const mapped = await this.symbolMapper.batchMapSymbols(symbolsToMap);
-      
-      // 3. Merge mapping
-      const symbolsWithMapping = allSymbols
-        .map(s => {
-          const mapping = mapped.find(m => m.symbol === s.symbol);
-          return mapping ? { ...s, coinId: mapping.coinId } : null;
-        })
-        .filter(s => s !== null);
-  
-      if (symbolsWithMapping.length === 0) return [];
-  
-      // 4. Get market caps
-      const symbolsWithMC = await this.getMarketCapsFromCoinGecko(symbolsWithMapping);
-  
-      // 5. Filter ONLY by MC (20M - 150M)
-      const filtered = symbolsWithMC.filter(s => {
-        const mc = s.marketCap;
-        const passedMC = mc >= CONFIG.MIN_MARKET_CAP && mc <= CONFIG.MAX_MARKET_CAP;
-        
-        if (passedMC) {
-          console.log(`[FILTER] ✅ ${s.symbol} | MC: $${(mc/1e6).toFixed(1)}M | Vol: $${(s.volume24/1e6).toFixed(1)}M`);
-        }
-        return passedMC;
-      });
-  
-      // Sort by volume (most active first)
-      filtered.sort((a, b) => b.volume24 - a.volume24);
-  
-      console.log(`[FILTER] Final result: ${filtered.length} symbols in MC range 20-150M`);
-      return filtered.map(s => s.symbol);
-      
-    } catch (error) {
-      console.error('[FILTER] Error:', error.message);
-      return [];
+  cleanupOld() {
+    const now = Date.now();
+    const maxAge = 10 * 60 * 1000; // 10 minutes
+    
+    for (const [symbol, data] of this.oiData.entries()) {
+      if (now - data.timestamp > maxAge) {
+        this.oiData.delete(symbol);
+      }
     }
   }
 }
 
 // ============================================================================
-// VOLUME AGGREGATOR (unchanged)
+// VOLUME AGGREGATOR
 // ============================================================================
 
 class VolumeAggregator {
@@ -397,7 +187,7 @@ class VolumeAggregator {
 }
 
 // ============================================================================
-// TREND ANALYZER (unchanged)
+// TREND ANALYZER
 // ============================================================================
 
 class TrendAnalyzer {
@@ -481,7 +271,7 @@ class TrendAnalyzer {
 }
 
 // ============================================================================
-// COOLDOWN MANAGER (unchanged)
+// COOLDOWN MANAGER
 // ============================================================================
 
 class CooldownManager {
@@ -522,73 +312,11 @@ class CooldownManager {
 }
 
 // ============================================================================
-// MARKET DATA FETCHER (enhanced)
-// ============================================================================
-
-class MarketDataFetcher {
-  constructor() {
-    this.cache = new Map();
-    this.cacheTimeout = 60000;
-  }
-
-  async getMarketData(symbol) {
-    const cached = this.cache.get(symbol);
-    if (cached && Date.now() - cached.timestamp < this.cacheTimeout) {
-      return cached.data;
-    }
-
-    try {
-      const detailRes = await axios.get(`${CONFIG.MEXC_API}/detail`, {
-        params: { symbol },
-        timeout: 5000
-      });
-
-      const data = {
-        openInterest: 0,
-        fundingRate: 0,
-        marketCap: 50_000_000,
-        lastPrice: 0
-      };
-
-      if (detailRes.data && detailRes.data.data) {
-        const detail = detailRes.data.data;
-        data.openInterest = parseFloat(detail.openInterest) || 0;
-        data.fundingRate = parseFloat(detail.fundingRate) || 0;
-        data.lastPrice = parseFloat(detail.lastPrice) || 0;
-      }
-
-      data.marketCap = this.estimateMarketCap(data.openInterest);
-
-      this.cache.set(symbol, {
-        timestamp: Date.now(),
-        data
-      });
-
-      return data;
-    } catch (error) {
-      return {
-        openInterest: 0,
-        fundingRate: 0,
-        marketCap: 50_000_000,
-        lastPrice: 0
-      };
-    }
-  }
-
-  estimateMarketCap(oi) {
-    if (oi > 100_000_000) return 500_000_000;
-    if (oi > 50_000_000) return 200_000_000;
-    if (oi > 10_000_000) return 50_000_000;
-    return 30_000_000;
-  }
-}
-
-// ============================================================================
-// ALERT FORMATTER (unchanged)
+// ALERT FORMATTER
 // ============================================================================
 
 class AlertFormatter {
-  format(symbol, stats, context, marketData) {
+  format(symbol, stats, context, oiData) {
     const type = stats.dominantSide === 'sell' ? 'ЛОНГОВ' : 'ШОРТОВ';
     const emoji = stats.dominantSide === 'sell' ? '🔴' : '🟢';
     
@@ -601,12 +329,12 @@ class AlertFormatter {
     
     lines.push(`🔥 ${symbol}`);
     
-    if (marketData) {
-      if (marketData.marketCap > 0) {
-        lines.push(`💎 Mcap: $${this.formatNumber(marketData.marketCap)}`);
-      }
-      if (marketData.fundingRate !== 0) {
-        lines.push(`⚪️ Funding Rate: ${(marketData.fundingRate * 100).toFixed(4)}%`);
+    if (oiData) {
+      const oiValue = oiData.oi * oiData.lastPrice;
+      lines.push(`💰 Open Interest: $${this.formatNumber(oiValue)}`);
+      
+      if (oiData.fundingRate !== 0) {
+        lines.push(`⚪️ Funding Rate: ${(oiData.fundingRate * 100).toFixed(4)}%`);
       }
     }
     
@@ -642,11 +370,6 @@ class AlertFormatter {
       lines.push(`${priceEmoji} Цена (ивент): ${stats.priceChange > 0 ? '+' : ''}${stats.priceChange.toFixed(2)}%`);
     }
     
-    if (marketData && marketData.openInterest > 0 && marketData.marketCap > 0) {
-      const oiRatio = marketData.openInterest / marketData.marketCap;
-      lines.push(`📊 OI / MC: ${oiRatio.toFixed(2)}`);
-    }
-    
     return lines.join('\n');
   }
 
@@ -668,14 +391,14 @@ class AlertFormatter {
 }
 
 // ============================================================================
-// ALERT TRIGGER ENGINE (unchanged)
+// ALERT TRIGGER ENGINE
 // ============================================================================
 
 class AlertTrigger {
-  constructor(telegram, cooldownManager, marketDataFetcher, trendAnalyzer) {
+  constructor(telegram, cooldownManager, oiTracker, trendAnalyzer) {
     this.telegram = telegram;
     this.cooldownManager = cooldownManager;
-    this.marketDataFetcher = marketDataFetcher;
+    this.oiTracker = oiTracker;
     this.trendAnalyzer = trendAnalyzer;
     this.formatter = new AlertFormatter();
   }
@@ -686,10 +409,18 @@ class AlertTrigger {
     for (const [window, stats] of Object.entries(allStats)) {
       if (!stats) continue;
       
-      if (stats.totalVolume >= CONFIG.MIN_VOLUME_USD &&
-          stats.dominance >= CONFIG.MIN_DOMINANCE) {
-        
-        if (!bestStats || stats.dominance > bestStats.dominance) {
+      // Два варіанти тригеру:
+      // 1. Volume >= 800k + dominance >= 65%
+      // 2. Volume >= 1M + dominance >= 65% (пріоритетніший)
+      
+      const meetsStandard = stats.totalVolume >= CONFIG.MIN_VOLUME_USD &&
+                           stats.dominance >= CONFIG.MIN_DOMINANCE;
+      
+      const meetsLarge = stats.totalVolume >= CONFIG.MIN_VOLUME_USD_LARGE &&
+                        stats.dominance >= CONFIG.MIN_DOMINANCE;
+      
+      if (meetsLarge || meetsStandard) {
+        if (!bestStats || stats.totalVolume > bestStats.totalVolume) {
           bestStats = stats;
         }
       }
@@ -701,9 +432,9 @@ class AlertTrigger {
       return;
     }
 
-    const marketData = await this.marketDataFetcher.getMarketData(symbol);
+    const oiData = this.oiTracker.getOI(symbol);
     const context = this.trendAnalyzer.getContext(symbol);
-    const message = this.formatter.format(symbol, bestStats, context, marketData);
+    const message = this.formatter.format(symbol, bestStats, context, oiData);
     
     try {
       await this.telegram.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message);
@@ -717,69 +448,23 @@ class AlertTrigger {
 }
 
 // ============================================================================
-// SUBSCRIPTION MANAGER
-// ============================================================================
-
-class SubscriptionManager {
-  constructor(wsListener, symbolFilter) {
-    this.wsListener = wsListener;
-    this.symbolFilter = symbolFilter;
-    this.currentSymbols = new Set();
-  }
-
-  async refreshSubscriptions() {
-    console.log('\n[SUBSCRIPTION] Starting refresh...');
-    
-    // Get filtered symbols
-    const newSymbols = await this.symbolFilter.getFilteredSymbols();
-    
-    if (newSymbols.length === 0) {
-      console.log('[SUBSCRIPTION] No symbols passed filter, keeping current subscriptions');
-      return;
-    }
-
-    const newSymbolsSet = new Set(newSymbols);
-
-    // Unsubscribe from old symbols
-    for (const oldSymbol of this.currentSymbols) {
-      if (!newSymbolsSet.has(oldSymbol)) {
-        this.wsListener.unsubscribeFromTrades(oldSymbol);
-      }
-    }
-
-    // Subscribe to new symbols
-    for (const newSymbol of newSymbols) {
-      if (!this.currentSymbols.has(newSymbol)) {
-        this.wsListener.subscribeToTrades(newSymbol);
-      }
-    }
-
-    this.currentSymbols = newSymbolsSet;
-    console.log(`[SUBSCRIPTION] Refresh complete. Monitoring ${this.currentSymbols.size} symbols\n`);
-  }
-
-  scheduleRefresh() {
-    setInterval(() => {
-      this.refreshSubscriptions();
-    }, CONFIG.REFRESH_SYMBOLS_HOURS * 60 * 60 * 1000);
-  }
-}
-
-// ============================================================================
-// WEBSOCKET LISTENER (enhanced)
+// WEBSOCKET LISTENER
 // ============================================================================
 
 class MEXCWebSocketListener {
-  constructor(volumeAggregator, trendAnalyzer, alertTrigger) {
+  constructor(volumeAggregator, trendAnalyzer, alertTrigger, oiTracker) {
     this.volumeAggregator = volumeAggregator;
     this.trendAnalyzer = trendAnalyzer;
     this.alertTrigger = alertTrigger;
+    this.oiTracker = oiTracker;
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 5000;
-    this.subscribedSymbols = new Set();
+    this.activeSymbols = new Set();
+    this.allSymbols = [];
     this.pingInterval = null;
+    this.refreshInterval = null;
   }
 
   async connect() {
@@ -787,10 +472,16 @@ class MEXCWebSocketListener {
     
     this.ws = new WebSocket(CONFIG.MEXC_WS);
 
-    this.ws.on('open', () => {
+    this.ws.on('open', async () => {
       console.log('[WS] Connected successfully');
       this.reconnectAttempts = 0;
       this.startPingInterval();
+      
+      // Subscribe to all symbols for OI data
+      await this.subscribeToAllSymbols();
+      
+      // Start periodic refresh
+      this.startRefreshInterval();
     });
 
     this.ws.on('message', (data) => {
@@ -804,8 +495,167 @@ class MEXCWebSocketListener {
     this.ws.on('close', () => {
       console.log('[WS] Connection closed');
       this.stopPingInterval();
+      this.stopRefreshInterval();
       this.reconnect();
     });
+  }
+
+  async subscribeToAllSymbols() {
+    console.log('\n[INIT] Subscribing to all symbols for OI tracking...');
+    
+    // Subscribe to deal (trades) + detail (OI, funding) for all symbols
+    // We'll filter later based on OI
+    
+    // Get list of all symbols (simplified - subscribe to pattern)
+    // MEXC supports wildcard subscriptions
+    
+    // For now, subscribe to popular symbols initially
+    const initialSymbols = [
+      'BTC_USDT', 'ETH_USDT', 'SOL_USDT', 'BNB_USDT', 'XRP_USDT',
+      'ADA_USDT', 'DOGE_USDT', 'AVAX_USDT', 'MATIC_USDT', 'DOT_USDT',
+      'TRX_USDT', 'LINK_USDT', 'UNI_USDT', 'ATOM_USDT', 'LTC_USDT'
+    ];
+    
+    for (const symbol of initialSymbols) {
+      this.subscribeToSymbol(symbol);
+    }
+    
+    console.log('[INIT] Initial subscriptions complete. Will discover more symbols via WS messages.\n');
+  }
+
+  subscribeToSymbol(symbol) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    try {
+      // Subscribe to trades
+      this.ws.send(JSON.stringify({
+        method: 'sub.deal',
+        param: { symbol }
+      }));
+      
+      // Subscribe to contract details (OI, funding rate)
+      this.ws.send(JSON.stringify({
+        method: 'sub.detail',
+        param: { symbol }
+      }));
+      
+      this.allSymbols.push(symbol);
+      console.log(`[WS] Subscribed to ${symbol}`);
+    } catch (error) {
+      console.error(`[ERROR] Failed to subscribe to ${symbol}:`, error.message);
+    }
+  }
+
+  unsubscribeFromSymbol(symbol) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    try {
+      this.ws.send(JSON.stringify({
+        method: 'unsub.deal',
+        param: { symbol }
+      }));
+      
+      this.ws.send(JSON.stringify({
+        method: 'unsub.detail',
+        param: { symbol }
+      }));
+      
+      console.log(`[WS] Unsubscribed from ${symbol}`);
+    } catch (error) {
+      console.error(`[ERROR] Failed to unsubscribe from ${symbol}:`, error.message);
+    }
+  }
+
+  handleMessage(data) {
+    try {
+      const message = JSON.parse(data);
+      
+      if (message.channel === 'pong') {
+        return;
+      }
+      
+      if (message.channel === 'rs.error') {
+        console.error('[WS] Subscription error:', message);
+        return;
+      }
+      
+      // Handle trades
+      if (message.channel === 'push.deal' && message.data && message.data.deals) {
+        const symbol = message.symbol;
+        
+        for (const deal of message.data.deals) {
+          const trade = {
+            timestamp: deal.t || Date.now(),
+            price: parseFloat(deal.p),
+            quantity: parseFloat(deal.v),
+            side: deal.T === 1 ? 'buy' : 'sell'
+          };
+          
+          if (isNaN(trade.price) || isNaN(trade.quantity)) {
+            continue;
+          }
+          
+          // Only process if symbol passes OI filter
+          if (this.activeSymbols.has(symbol)) {
+            this.volumeAggregator.addTrade(symbol, trade);
+            this.trendAnalyzer.addTrade(symbol, trade);
+            
+            // Check for alerts
+            const allStats = this.volumeAggregator.getAllWindowStats(symbol);
+            this.alertTrigger.checkAndAlert(symbol, allStats);
+          }
+        }
+      }
+      
+      // Handle contract details (OI, funding rate, price)
+      if (message.channel === 'push.detail' && message.data) {
+        const symbol = message.symbol;
+        const data = message.data;
+        
+        const oi = parseFloat(data.openInterest) || 0;
+        const lastPrice = parseFloat(data.lastPrice) || 0;
+        const fundingRate = parseFloat(data.fundingRate) || 0;
+        
+        if (oi > 0 && lastPrice > 0) {
+          this.oiTracker.updateOI(symbol, oi, lastPrice, fundingRate);
+          
+          // Check if should be active
+          this.updateActiveSymbols();
+        }
+      }
+      
+    } catch (error) {
+      console.error('[ERROR] Failed to parse message:', error.message);
+    }
+  }
+
+  updateActiveSymbols() {
+    const filtered = this.oiTracker.getFilteredSymbols();
+    const newActive = new Set(filtered.map(f => f.symbol));
+    
+    // Subscribe to new symbols
+    for (const symbol of newActive) {
+      if (!this.activeSymbols.has(symbol)) {
+        console.log(`[FILTER] ✅ ${symbol} | OI: $${(filtered.find(f => f.symbol === symbol).oiValue / 1e6).toFixed(1)}M`);
+      }
+    }
+    
+    // Unsubscribe from old symbols (optional - can keep them for future)
+    // for (const symbol of this.activeSymbols) {
+    //   if (!newActive.has(symbol)) {
+    //     console.log(`[FILTER] ❌ ${symbol} - OI out of range`);
+    //   }
+    // }
+    
+    this.activeSymbols = newActive;
+    
+    if (this.activeSymbols.size > 0) {
+      console.log(`[FILTER] Monitoring ${this.activeSymbols.size} symbols with OI $${CONFIG.MIN_OPEN_INTEREST/1e6}M - $${CONFIG.MAX_OPEN_INTEREST/1e6}M`);
+    }
   }
 
   startPingInterval() {
@@ -827,81 +677,18 @@ class MEXCWebSocketListener {
     }
   }
 
-  subscribeToTrades(symbol) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const subscribeMsg = {
-      method: 'sub.deal',
-      param: { symbol }
-    };
-    
-    try {
-      this.ws.send(JSON.stringify(subscribeMsg));
-      this.subscribedSymbols.add(symbol);
-      console.log(`[WS] Subscribed to ${symbol}`);
-    } catch (error) {
-      console.error(`[ERROR] Failed to subscribe to ${symbol}:`, error.message);
-    }
+  startRefreshInterval() {
+    this.refreshInterval = setInterval(() => {
+      console.log('[REFRESH] Cleaning up old OI data...');
+      this.oiTracker.cleanupOld();
+      this.updateActiveSymbols();
+    }, CONFIG.REFRESH_SYMBOLS_MINUTES * 60 * 1000);
   }
 
-  unsubscribeFromTrades(symbol) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const unsubscribeMsg = {
-      method: 'unsub.deal',
-      param: { symbol }
-    };
-    
-    try {
-      this.ws.send(JSON.stringify(unsubscribeMsg));
-      this.subscribedSymbols.delete(symbol);
-      console.log(`[WS] Unsubscribed from ${symbol}`);
-    } catch (error) {
-      console.error(`[ERROR] Failed to unsubscribe from ${symbol}:`, error.message);
-    }
-  }
-
-  handleMessage(data) {
-    try {
-      const message = JSON.parse(data);
-      
-      if (message.channel === 'pong') {
-        return;
-      }
-      
-      if (message.channel === 'rs.error') {
-        console.error('[WS] Subscription error:', message);
-        return;
-      }
-      
-      if (message.channel === 'push.deal' && message.data && message.data.deals) {
-        const symbol = message.symbol;
-        
-        for (const deal of message.data.deals) {
-          const trade = {
-            timestamp: deal.t || Date.now(),
-            price: parseFloat(deal.p),
-            quantity: parseFloat(deal.v),
-            side: deal.T === 1 ? 'buy' : 'sell'
-          };
-          
-          if (isNaN(trade.price) || isNaN(trade.quantity)) {
-            continue;
-          }
-          
-          this.volumeAggregator.addTrade(symbol, trade);
-          this.trendAnalyzer.addTrade(symbol, trade);
-        }
-        
-        const allStats = this.volumeAggregator.getAllWindowStats(symbol);
-        this.alertTrigger.checkAndAlert(symbol, allStats);
-      }
-    } catch (error) {
-      console.error('[ERROR] Failed to parse message:', error.message);
+  stopRefreshInterval() {
+    if (this.refreshInterval) {
+      clearInterval(this.refreshInterval);
+      this.refreshInterval = null;
     }
   }
 
@@ -921,6 +708,7 @@ class MEXCWebSocketListener {
 
   close() {
     this.stopPingInterval();
+    this.stopRefreshInterval();
     if (this.ws) {
       this.ws.close();
     }
@@ -937,42 +725,38 @@ class LiquidationBot {
     this.volumeAggregator = new VolumeAggregator();
     this.trendAnalyzer = new TrendAnalyzer();
     this.cooldownManager = new CooldownManager(CONFIG.COOLDOWN_MINUTES);
-    this.marketDataFetcher = new MarketDataFetcher();
+    this.oiTracker = new OITracker();
     this.alertTrigger = new AlertTrigger(
       this.telegram,
       this.cooldownManager,
-      this.marketDataFetcher,
+      this.oiTracker,
       this.trendAnalyzer
     );
     this.wsListener = new MEXCWebSocketListener(
       this.volumeAggregator,
       this.trendAnalyzer,
-      this.alertTrigger
-    );
-    this.symbolMapper = new SymbolMapper();
-    this.symbolFilter = new SymbolFilter(this.symbolMapper);
-    this.subscriptionManager = new SubscriptionManager(
-      this.wsListener,
-      this.symbolFilter
+      this.alertTrigger,
+      this.oiTracker
     );
   }
 
   async start() {
     console.log('='.repeat(60));
-    console.log('MEXC LIQUIDATION ALERT BOT - ENHANCED');
+    console.log('MEXC LIQUIDATION ALERT BOT - WebSocket Only');
     console.log('='.repeat(60));
-    console.log(`Min Volume: $${CONFIG.MIN_VOLUME_USD.toLocaleString()}`);
+    console.log(`Alert Volume Threshold: $${CONFIG.MIN_VOLUME_USD.toLocaleString()}`);
+    console.log(`Large Volume Threshold: $${CONFIG.MIN_VOLUME_USD_LARGE.toLocaleString()}`);
     console.log(`Min Dominance: ${CONFIG.MIN_DOMINANCE}%`);
-    console.log(`Market Cap: $${CONFIG.MIN_MARKET_CAP.toLocaleString()} - $${CONFIG.MAX_MARKET_CAP.toLocaleString()}`);
+    console.log(`OI Range: $${CONFIG.MIN_OPEN_INTEREST.toLocaleString()} - $${CONFIG.MAX_OPEN_INTEREST.toLocaleString()}`);
     console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} minutes`);
-    console.log(`Refresh: every ${CONFIG.REFRESH_SYMBOLS_HOURS} hours`);
+    console.log(`Refresh: every ${CONFIG.REFRESH_SYMBOLS_MINUTES} minutes`);
     console.log('='.repeat(60));
 
     // Test Telegram
     try {
       await this.telegram.sendMessage(
         CONFIG.TELEGRAM_CHAT_ID,
-        '🚀 MEXC Liquidation Bot Started (Enhanced)\n\nФільтрація по OI/MC активна!'
+        '🚀 MEXC Liquidation Bot Started (WebSocket Only)\n\nФільтрація по OI активна!'
       );
       console.log('[TELEGRAM] Connection successful\n');
     } catch (error) {
@@ -982,17 +766,6 @@ class LiquidationBot {
 
     // Connect WebSocket
     await this.wsListener.connect();
-
-    // Wait for WS to connect
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Initial subscription
-    console.log('\n[INIT] Starting initial symbol filtering...\n');
-    await this.subscriptionManager.refreshSubscriptions();
-
-    // Schedule periodic refresh
-    this.subscriptionManager.scheduleRefresh();
-    console.log(`[INIT] Scheduled refresh every ${CONFIG.REFRESH_SYMBOLS_HOURS} hours\n`);
 
     // Shutdown handlers
     process.on('SIGINT', () => this.shutdown());
