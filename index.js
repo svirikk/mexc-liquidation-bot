@@ -25,8 +25,6 @@ const CONFIG = {
   // Market Cap & OI/MC filters
   MIN_MARKET_CAP: parseInt(process.env.MIN_MARKET_CAP) || 20_000_000,
   MAX_MARKET_CAP: parseInt(process.env.MAX_MARKET_CAP) || 150_000_000,
-  MIN_OI_MC_RATIO: parseFloat(process.env.MIN_OI_MC_RATIO) || 0.25,
-  MAX_OI_MC_RATIO: parseFloat(process.env.MAX_OI_MC_RATIO) || 10,
   MIN_VOLUME_24H: parseInt(process.env.MIN_VOLUME_24H) || 1_000_000,
   
   // Refresh settings
@@ -966,7 +964,6 @@ class LiquidationBot {
     console.log(`Min Volume: $${CONFIG.MIN_VOLUME_USD.toLocaleString()}`);
     console.log(`Min Dominance: ${CONFIG.MIN_DOMINANCE}%`);
     console.log(`Market Cap: $${CONFIG.MIN_MARKET_CAP.toLocaleString()} - $${CONFIG.MAX_MARKET_CAP.toLocaleString()}`);
-    console.log(`OI/MC Ratio: ${CONFIG.MIN_OI_MC_RATIO} - ${CONFIG.MAX_OI_MC_RATIO}`);
     console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} minutes`);
     console.log(`Refresh: every ${CONFIG.REFRESH_SYMBOLS_HOURS} hours`);
     console.log('='.repeat(60));
