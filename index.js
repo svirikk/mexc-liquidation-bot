@@ -10,6 +10,7 @@ if (process.env.NODE_ENV !== 'production') {
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // ============================================================================
 // CONFIGURATION
@@ -37,6 +38,9 @@ const CONFIG = {
   // Telegram
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
+  
+  // Proxy (optional - for geo-blocked regions)
+  HTTP_PROXY: process.env.HTTP_PROXY || null,
 };
 
 // ============================================================================
@@ -53,12 +57,27 @@ class MarketDataManager {
     console.log('[API] Fetching market data from Bybit...');
     
     try {
-      // Get tickers (price, volume, OI)
-      const tickersRes = await axios.get(`${CONFIG.BYBIT_REST_API}/v5/market/tickers`, {
+      // Setup proxy if provided
+      const axiosConfig = {
         params: {
           category: 'linear'
-        }
-      });
+        },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000
+      };
+
+      // Add proxy if configured
+      if (CONFIG.HTTP_PROXY) {
+        console.log('[API] Using proxy:', CONFIG.HTTP_PROXY);
+        axiosConfig.httpsAgent = new HttpsProxyAgent(CONFIG.HTTP_PROXY);
+      }
+
+      // Get tickers (price, volume, OI)
+      const tickersRes = await axios.get(`${CONFIG.BYBIT_REST_API}/v5/market/tickers`, axiosConfig);
 
       if (tickersRes.data.retCode !== 0) {
         throw new Error(`Bybit API error: ${tickersRes.data.retMsg}`);
@@ -100,12 +119,35 @@ class MarketDataManager {
 
       console.log(`[API] Total markets: ${tickers.length}`);
       console.log(`[API] Eligible symbols: ${eligibleCount}`);
-      console.log(`[API] OI range: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-      console.log(`[API] Min 24h volume: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M\n`);
+      console.log(`[API] Filters applied:`);
+      console.log(`      - OI range: ${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - ${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
+      console.log(`      - Min 24h volume: ${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
+      
+      if (eligibleCount > 0) {
+        console.log(`[API] ✅ Found ${eligibleCount} eligible symbols`);
+      } else {
+        console.log(`[API] ⚠️  WARNING: No symbols match the criteria!`);
+        console.log(`[API] Try adjusting MIN_OPEN_INTEREST or MIN_VOLUME_24H in .env`);
+      }
+      console.log('');
 
       return Array.from(this.eligibleSymbols);
     } catch (error) {
-      console.error('[API] Failed to fetch markets:', error.message);
+      console.error('[API] ❌ Failed to fetch markets:', error.message);
+      
+      if (error.response) {
+        console.error(`[API] Response status: ${error.response.status}`);
+        console.error(`[API] Response data:`, error.response.data);
+      }
+      
+      if (error.response && error.response.status === 403) {
+        console.error('[API] 🚫 Access forbidden - Bybit may be blocking your IP');
+        console.error('[API] Solutions:');
+        console.error('[API]   1. Try using a VPN or proxy');
+        console.error('[API]   2. Check if your hosting provider is blocked');
+        console.error('[API]   3. Wait a few minutes and restart');
+      }
+      
       return [];
     }
   }
@@ -376,7 +418,15 @@ class BybitWebSocketListener {
   async connect() {
     console.log('[WS] Connecting to Bybit WebSocket...');
     
-    this.ws = new WebSocket(CONFIG.BYBIT_WS_PUBLIC);
+    const wsOptions = {};
+    
+    // Add proxy for WebSocket if configured
+    if (CONFIG.HTTP_PROXY) {
+      console.log('[WS] Using proxy:', CONFIG.HTTP_PROXY);
+      wsOptions.agent = new HttpsProxyAgent(CONFIG.HTTP_PROXY);
+    }
+    
+    this.ws = new WebSocket(CONFIG.BYBIT_WS_PUBLIC, wsOptions);
 
     this.ws.on('open', () => {
       console.log('[WS] Connected successfully');
@@ -428,7 +478,24 @@ class BybitWebSocketListener {
       batch.forEach(symbol => this.subscribedSymbols.add(symbol));
     }
 
-    console.log(`[WS] Subscribed to ${eligibleSymbols.length} symbols\n`);
+    console.log(`[WS] ✅ Subscribed to ${eligibleSymbols.length} symbols`);
+    console.log('[WS] 📊 Monitored symbols:');
+    
+    // Show first 20 symbols with their OI
+    const symbolsToShow = eligibleSymbols.slice(0, 20);
+    symbolsToShow.forEach(symbol => {
+      const data = this.marketDataManager.getMarketData(symbol);
+      if (data) {
+        console.log(`     ${symbol.padEnd(15)} | OI: ${(data.oi / 1e6).toFixed(1)}M | Vol: ${(data.volume24h / 1e6).toFixed(1)}M`);
+      }
+    });
+    
+    if (eligibleSymbols.length > 20) {
+      console.log(`     ... and ${eligibleSymbols.length - 20} more`);
+    }
+    
+    console.log('\n[STATUS] 🎯 Bot is now monitoring liquidations...');
+    console.log('[STATUS] ⏳ Waiting for liquidation events (threshold: $1M, dominance: 65%)\n');
   }
 
   handleMessage(data) {
@@ -464,6 +531,10 @@ class BybitWebSocketListener {
           value: parseFloat(data.price) * parseFloat(data.size)
         };
 
+        // Log individual liquidation
+        const liqType = liquidation.side === 'Sell' ? 'LONG' : 'SHORT';
+        console.log(`[LIQ] ${symbol} | ${liqType} | ${(liquidation.value / 1000).toFixed(1)}K @ ${liquidation.price}`);
+
         // Update price
         this.marketDataManager.updatePrice(symbol, liquidation.price);
 
@@ -473,6 +544,11 @@ class BybitWebSocketListener {
         // Check for alerts
         const stats = this.liquidationTracker.getWindowStats(symbol);
         if (stats) {
+          // Log accumulated volume (only if significant)
+          if (stats.totalVolume > 100000) {
+            console.log(`[ACCUM] ${symbol} | ${(stats.totalVolume / 1e6).toFixed(2)}M total | ${stats.dominance.toFixed(1)}% ${stats.dominantSide}`);
+          }
+          
           this.alertTrigger.checkAndAlert(symbol, stats);
         }
       }
