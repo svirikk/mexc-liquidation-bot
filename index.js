@@ -10,7 +10,6 @@ if (process.env.NODE_ENV !== 'production') {
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // ============================================================================
 // CONFIGURATION
@@ -38,9 +37,6 @@ const CONFIG = {
   // Telegram
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
-  
-  // Proxy (optional - for geo-blocked regions)
-  HTTP_PROXY: process.env.HTTP_PROXY || null,
 };
 
 // ============================================================================
@@ -57,27 +53,17 @@ class MarketDataManager {
     console.log('[API] Fetching market data from Bybit...');
     
     try {
-      // Setup proxy if provided
-      const axiosConfig = {
+      // Get tickers (price, volume, OI)
+      const tickersRes = await axios.get(`${CONFIG.BYBIT_REST_API}/v5/market/tickers`, {
         params: {
           category: 'linear'
         },
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
+          'Accept': 'application/json'
         },
         timeout: 15000
-      };
-
-      // Add proxy if configured
-      if (CONFIG.HTTP_PROXY) {
-        console.log('[API] Using proxy:', CONFIG.HTTP_PROXY);
-        axiosConfig.httpsAgent = new HttpsProxyAgent(CONFIG.HTTP_PROXY);
-      }
-
-      // Get tickers (price, volume, OI)
-      const tickersRes = await axios.get(`${CONFIG.BYBIT_REST_API}/v5/market/tickers`, axiosConfig);
+      });
 
       if (tickersRes.data.retCode !== 0) {
         throw new Error(`Bybit API error: ${tickersRes.data.retMsg}`);
@@ -85,6 +71,7 @@ class MarketDataManager {
 
       const tickers = tickersRes.data.result.list;
       let eligibleCount = 0;
+      const allSymbols = [];
 
       for (const ticker of tickers) {
         const symbol = ticker.symbol;
@@ -96,6 +83,8 @@ class MarketDataManager {
         const volume24h = parseFloat(ticker.turnover24h) || 0;
         const oi = parseFloat(ticker.openInterest) || 0;
         const oiValue = oi * price;
+
+        allSymbols.push({ symbol, oiValue, volume24h, price });
 
         // Store market data
         this.markets.set(symbol, {
@@ -119,35 +108,29 @@ class MarketDataManager {
 
       console.log(`[API] Total markets: ${tickers.length}`);
       console.log(`[API] Eligible symbols: ${eligibleCount}`);
-      console.log(`[API] Filters applied:`);
-      console.log(`      - OI range: ${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - ${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-      console.log(`      - Min 24h volume: ${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
+      console.log(`[API] Filters:`);
+      console.log(`      - OI: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
+      console.log(`      - Min 24h volume: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
       
-      if (eligibleCount > 0) {
-        console.log(`[API] ✅ Found ${eligibleCount} eligible symbols`);
+      if (eligibleCount === 0) {
+        console.log(`\n[API] ⚠️  No symbols match criteria. Top 10 by OI:`);
+        allSymbols
+          .sort((a, b) => b.oiValue - a.oiValue)
+          .slice(0, 10)
+          .forEach((s, i) => {
+            console.log(`      ${(i + 1).toString().padStart(2)}. ${s.symbol.padEnd(12)} | OI: $${(s.oiValue / 1e6).toFixed(1)}M | Vol: $${(s.volume24h / 1e6).toFixed(1)}M`);
+          });
       } else {
-        console.log(`[API] ⚠️  WARNING: No symbols match the criteria!`);
-        console.log(`[API] Try adjusting MIN_OPEN_INTEREST or MIN_VOLUME_24H in .env`);
+        console.log(`[API] ✅ Monitoring ${eligibleCount} symbols`);
       }
       console.log('');
 
       return Array.from(this.eligibleSymbols);
     } catch (error) {
       console.error('[API] ❌ Failed to fetch markets:', error.message);
-      
       if (error.response) {
-        console.error(`[API] Response status: ${error.response.status}`);
-        console.error(`[API] Response data:`, error.response.data);
+        console.error(`[API] Status: ${error.response.status}`);
       }
-      
-      if (error.response && error.response.status === 403) {
-        console.error('[API] 🚫 Access forbidden - Bybit may be blocking your IP');
-        console.error('[API] Solutions:');
-        console.error('[API]   1. Try using a VPN or proxy');
-        console.error('[API]   2. Check if your hosting provider is blocked');
-        console.error('[API]   3. Wait a few minutes and restart');
-      }
-      
       return [];
     }
   }
@@ -418,18 +401,10 @@ class BybitWebSocketListener {
   async connect() {
     console.log('[WS] Connecting to Bybit WebSocket...');
     
-    const wsOptions = {};
-    
-    // Add proxy for WebSocket if configured
-    if (CONFIG.HTTP_PROXY) {
-      console.log('[WS] Using proxy:', CONFIG.HTTP_PROXY);
-      wsOptions.agent = new HttpsProxyAgent(CONFIG.HTTP_PROXY);
-    }
-    
-    this.ws = new WebSocket(CONFIG.BYBIT_WS_PUBLIC, wsOptions);
+    this.ws = new WebSocket(CONFIG.BYBIT_WS_PUBLIC);
 
     this.ws.on('open', () => {
-      console.log('[WS] Connected successfully');
+      console.log('[WS] ✅ Connected successfully');
       this.reconnectAttempts = 0;
       this.startPingInterval();
       this.subscribeToLiquidations();
@@ -458,11 +433,11 @@ class BybitWebSocketListener {
     const eligibleSymbols = this.marketDataManager.getEligibleSymbols();
     
     if (eligibleSymbols.length === 0) {
-      console.log('[WS] No eligible symbols to subscribe');
+      console.log('[WS] ⚠️  No eligible symbols to subscribe');
       return;
     }
 
-    console.log(`[WS] Subscribing to liquidations for ${eligibleSymbols.length} symbols...`);
+    console.log(`[WS] 📡 Subscribing to ${eligibleSymbols.length} symbols...`);
 
     // Subscribe in batches of 10
     const batchSize = 10;
@@ -479,23 +454,22 @@ class BybitWebSocketListener {
     }
 
     console.log(`[WS] ✅ Subscribed to ${eligibleSymbols.length} symbols`);
-    console.log('[WS] 📊 Monitored symbols:');
+    console.log('[WS] 📊 Monitored symbols (first 15):');
     
-    // Show first 20 symbols with their OI
-    const symbolsToShow = eligibleSymbols.slice(0, 20);
-    symbolsToShow.forEach(symbol => {
+    eligibleSymbols.slice(0, 15).forEach(symbol => {
       const data = this.marketDataManager.getMarketData(symbol);
       if (data) {
-        console.log(`     ${symbol.padEnd(15)} | OI: ${(data.oi / 1e6).toFixed(1)}M | Vol: ${(data.volume24h / 1e6).toFixed(1)}M`);
+        console.log(`     ${symbol.padEnd(15)} | OI: $${(data.oi / 1e6).toFixed(1)}M`);
       }
     });
     
-    if (eligibleSymbols.length > 20) {
-      console.log(`     ... and ${eligibleSymbols.length - 20} more`);
+    if (eligibleSymbols.length > 15) {
+      console.log(`     ... and ${eligibleSymbols.length - 15} more`);
     }
     
-    console.log('\n[STATUS] 🎯 Bot is now monitoring liquidations...');
-    console.log('[STATUS] ⏳ Waiting for liquidation events (threshold: $1M, dominance: 65%)\n');
+    console.log('\n[STATUS] 🎯 Monitoring liquidations...');
+    console.log(`[STATUS] 💰 Threshold: $${(CONFIG.MIN_LIQUIDATION_VOLUME / 1e6).toFixed(1)}M volume, ${CONFIG.MIN_DOMINANCE}% dominance`);
+    console.log('[STATUS] ⏳ Waiting for liquidation events...\n');
   }
 
   handleMessage(data) {
@@ -516,24 +490,26 @@ class BybitWebSocketListener {
       if (message.topic && message.topic.startsWith('liquidation.')) {
         const symbol = message.topic.replace('liquidation.', '');
         
+        const rawData = message.data;
+        const liqValue = parseFloat(rawData.price) * parseFloat(rawData.size);
+        const liqType = rawData.side === 'Sell' ? '🔴 LONG' : '🟢 SHORT';
+        
+        // Log individual liquidation
+        console.log(`[LIQ] ${symbol.padEnd(12)} | ${liqType} | $${(liqValue / 1000).toFixed(1)}K @ $${parseFloat(rawData.price).toFixed(2)}`);
+        
         // Only process eligible symbols
         if (!this.marketDataManager.isEligible(symbol)) {
+          console.log(`      └─ ⏭️  Skipped (not eligible)`);
           return;
         }
 
-        const data = message.data;
-        
         const liquidation = {
-          timestamp: data.updatedTime || Date.now(),
-          side: data.side, // 'Buy' or 'Sell'
-          price: parseFloat(data.price),
-          size: parseFloat(data.size),
-          value: parseFloat(data.price) * parseFloat(data.size)
+          timestamp: rawData.updatedTime || Date.now(),
+          side: rawData.side, // 'Buy' or 'Sell'
+          price: parseFloat(rawData.price),
+          size: parseFloat(rawData.size),
+          value: liqValue
         };
-
-        // Log individual liquidation
-        const liqType = liquidation.side === 'Sell' ? 'LONG' : 'SHORT';
-        console.log(`[LIQ] ${symbol} | ${liqType} | ${(liquidation.value / 1000).toFixed(1)}K @ ${liquidation.price}`);
 
         // Update price
         this.marketDataManager.updatePrice(symbol, liquidation.price);
@@ -544,9 +520,15 @@ class BybitWebSocketListener {
         // Check for alerts
         const stats = this.liquidationTracker.getWindowStats(symbol);
         if (stats) {
-          // Log accumulated volume (only if significant)
-          if (stats.totalVolume > 100000) {
-            console.log(`[ACCUM] ${symbol} | ${(stats.totalVolume / 1e6).toFixed(2)}M total | ${stats.dominance.toFixed(1)}% ${stats.dominantSide}`);
+          const accType = stats.dominantSide === 'long' ? '🔴 LONG' : '🟢 SHORT';
+          console.log(`[ACCUM] ${symbol.padEnd(12)} | Total: $${(stats.totalVolume / 1000).toFixed(1)}K | ${accType} ${stats.dominance.toFixed(1)}% | ${stats.duration.toFixed(0)}s`);
+          
+          // Show progress
+          if (stats.totalVolume >= CONFIG.MIN_LIQUIDATION_VOLUME && stats.dominance >= CONFIG.MIN_DOMINANCE) {
+            console.log(`        └─ 🎯 THRESHOLD MET! Sending alert...`);
+          } else {
+            const volPct = (stats.totalVolume / CONFIG.MIN_LIQUIDATION_VOLUME * 100).toFixed(0);
+            console.log(`        └─ 📊 ${volPct}% volume | ${stats.dominance.toFixed(1)}% dominance`);
           }
           
           this.alertTrigger.checkAndAlert(symbol, stats);
@@ -652,9 +634,9 @@ class LiquidationBot {
         CONFIG.TELEGRAM_CHAT_ID,
         '🚀 Bybit Liquidation Bot Started\n\n✅ Real-time liquidation tracking active!'
       );
-      console.log('[TELEGRAM] Connection successful\n');
+      console.log('[TELEGRAM] ✅ Connection successful\n');
     } catch (error) {
-      console.error('[TELEGRAM] Failed to connect:', error.message);
+      console.error('[TELEGRAM] ❌ Failed to connect:', error.message);
       process.exit(1);
     }
 
