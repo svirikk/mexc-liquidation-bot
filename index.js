@@ -27,6 +27,9 @@ const CONFIG = {
   MAX_OPEN_INTEREST: parseInt(process.env.MAX_OPEN_INTEREST) || 50_000_000,
   MIN_VOLUME_24H: parseInt(process.env.MIN_VOLUME_24H) || 1_000_000,
   
+  // Debug mode - monitor ALL symbols (overrides filters)
+  MONITOR_ALL_SYMBOLS: process.env.MONITOR_ALL_SYMBOLS === 'true',
+  
   // Refresh settings
   REFRESH_MARKETS_MINUTES: parseInt(process.env.REFRESH_MARKETS_MINUTES) || 30,
   
@@ -95,10 +98,11 @@ class MarketDataManager {
         });
 
         // Check eligibility
-        const isEligible = 
+        const isEligible = CONFIG.MONITOR_ALL_SYMBOLS || (
           oiValue >= CONFIG.MIN_OPEN_INTEREST &&
           oiValue <= CONFIG.MAX_OPEN_INTEREST &&
-          volume24h >= CONFIG.MIN_VOLUME_24H;
+          volume24h >= CONFIG.MIN_VOLUME_24H
+        );
 
         if (isEligible) {
           this.eligibleSymbols.add(symbol);
@@ -108,9 +112,14 @@ class MarketDataManager {
 
       console.log(`[API] Total markets: ${tickers.length}`);
       console.log(`[API] Eligible symbols: ${eligibleCount}`);
-      console.log(`[API] Filters:`);
-      console.log(`      - OI: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-      console.log(`      - Min 24h volume: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
+      
+      if (CONFIG.MONITOR_ALL_SYMBOLS) {
+        console.log(`[API] 🔥 DEBUG MODE: Monitoring ALL symbols (filters disabled)`);
+      } else {
+        console.log(`[API] Filters:`);
+        console.log(`      - OI: ${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - ${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
+        console.log(`      - Min 24h volume: ${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
+      }
       
       if (eligibleCount === 0) {
         console.log(`\n[API] ⚠️  No symbols match criteria. Top 10 by OI:`);
@@ -396,6 +405,9 @@ class BybitWebSocketListener {
     this.reconnectDelay = 5000;
     this.pingInterval = null;
     this.subscribedSymbols = new Set();
+    this.lastHeartbeat = null;
+    this.subscriptionConfirmed = false;
+    this.activityCheckInterval = null;
   }
 
   async connect() {
@@ -408,6 +420,7 @@ class BybitWebSocketListener {
       this.reconnectAttempts = 0;
       this.startPingInterval();
       this.subscribeToLiquidations();
+      this.startActivityCheck();
     });
 
     this.ws.on('message', (data) => {
@@ -421,6 +434,7 @@ class BybitWebSocketListener {
     this.ws.on('close', () => {
       console.log('[WS] Connection closed');
       this.stopPingInterval();
+      this.stopActivityCheck();
       this.reconnect();
     });
   }
@@ -478,11 +492,20 @@ class BybitWebSocketListener {
       
       // Handle pong
       if (message.op === 'pong') {
+        // Show heartbeat every 5 minutes
+        if (!this.lastHeartbeat || Date.now() - this.lastHeartbeat > 300000) {
+          console.log('[WS] 💓 Heartbeat - connection alive');
+          this.lastHeartbeat = Date.now();
+        }
         return;
       }
 
       // Handle subscription success
       if (message.success === true) {
+        if (!this.subscriptionConfirmed) {
+          console.log('[WS] ✅ Subscription confirmed by Bybit');
+          this.subscriptionConfirmed = true;
+        }
         return;
       }
 
@@ -495,7 +518,7 @@ class BybitWebSocketListener {
         const liqType = rawData.side === 'Sell' ? '🔴 LONG' : '🟢 SHORT';
         
         // Log individual liquidation
-        console.log(`[LIQ] ${symbol.padEnd(12)} | ${liqType} | $${(liqValue / 1000).toFixed(1)}K @ $${parseFloat(rawData.price).toFixed(2)}`);
+        console.log(`[LIQ] ${symbol.padEnd(12)} | ${liqType} | ${(liqValue / 1000).toFixed(1)}K @ ${parseFloat(rawData.price).toFixed(2)}`);
         
         // Only process eligible symbols
         if (!this.marketDataManager.isEligible(symbol)) {
@@ -521,7 +544,7 @@ class BybitWebSocketListener {
         const stats = this.liquidationTracker.getWindowStats(symbol);
         if (stats) {
           const accType = stats.dominantSide === 'long' ? '🔴 LONG' : '🟢 SHORT';
-          console.log(`[ACCUM] ${symbol.padEnd(12)} | Total: $${(stats.totalVolume / 1000).toFixed(1)}K | ${accType} ${stats.dominance.toFixed(1)}% | ${stats.duration.toFixed(0)}s`);
+          console.log(`[ACCUM] ${symbol.padEnd(12)} | Total: ${(stats.totalVolume / 1000).toFixed(1)}K | ${accType} ${stats.dominance.toFixed(1)}% | ${stats.duration.toFixed(0)}s`);
           
           // Show progress
           if (stats.totalVolume >= CONFIG.MIN_LIQUIDATION_VOLUME && stats.dominance >= CONFIG.MIN_DOMINANCE) {
@@ -552,10 +575,26 @@ class BybitWebSocketListener {
     }, 20000);
   }
 
+  startActivityCheck() {
+    // Check every 10 minutes if we're receiving data
+    this.activityCheckInterval = setInterval(() => {
+      console.log('[STATUS] 🔍 Activity check - still monitoring...');
+      console.log(`[STATUS] 📊 Subscribed to ${this.subscribedSymbols.size} symbols`);
+      console.log(`[STATUS] ⏳ Waiting for liquidations... (This is normal during low volatility)`);
+    }, 600000); // 10 minutes
+  }
+
   stopPingInterval() {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
+    }
+  }
+
+  stopActivityCheck() {
+    if (this.activityCheckInterval) {
+      clearInterval(this.activityCheckInterval);
+      this.activityCheckInterval = null;
     }
   }
 
@@ -586,6 +625,7 @@ class BybitWebSocketListener {
 
   close() {
     this.stopPingInterval();
+    this.stopActivityCheck();
     if (this.ws) {
       this.ws.close();
     }
