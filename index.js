@@ -424,6 +424,14 @@ class BybitWebSocketListener {
     });
 
     this.ws.on('message', (data) => {
+      // Log EVERY message for debugging
+      const message = JSON.parse(data);
+      
+      // Skip only pings
+      if (message.op !== 'pong') {
+        console.log('[WS] 📨 RAW MESSAGE:', JSON.stringify(message).substring(0, 200));
+      }
+      
       this.handleMessage(data);
     });
 
@@ -457,7 +465,7 @@ class BybitWebSocketListener {
     const batchSize = 10;
     for (let i = 0; i < eligibleSymbols.length; i += batchSize) {
       const batch = eligibleSymbols.slice(i, i + batchSize);
-      const topics = batch.map(symbol => `liquidation.${symbol}`);
+      const topics = batch.map(symbol => `allLiquidation.${symbol}`); // ← CHANGED from 'liquidation.'
       
       this.ws.send(JSON.stringify({
         op: 'subscribe',
