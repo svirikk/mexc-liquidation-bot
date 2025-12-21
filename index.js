@@ -15,6 +15,14 @@
 // - Визначаємо домінування однієї сторони
 // - Підтверджуємо ціновим імпульсом
 // - Інтерпретуємо це як "примусову ліквідацію"
+//
+// 📊 ПРО ЧАС У ВІКНІ (чому завжди ~300 секунд?):
+// - Це НОРМАЛЬНО! Вікно агрегації = 300с (5 хв) або ваше налаштування
+// - Бот чекає поки накопичиться достатній об'єм ($1M+)
+// - Це зазвичай займає ВЕСЬ період вікна
+// - Якщо хочете швидші алерти → зменшіть AGGREGATION_WINDOW_SECONDS до 60-120с
+// - Але менше вікно = менше накопичується об'єм = менше якісних сигналів
+// - Рекомендовано: 120-300 секунд для балансу швидкості та якості
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -172,7 +180,7 @@ class MarketDataManager {
 
 class TradeAggregator {
   constructor() {
-    this.windows = new Map(); // symbol -> { trades: [], startPrice, lastPrice, startTime }
+    this.windows = new Map(); // symbol -> { trades: [], startPrice, lastPrice, startTime, alerted }
   }
 
   addTrade(symbol, trade) {
@@ -181,7 +189,8 @@ class TradeAggregator {
         trades: [],
         startPrice: trade.price,
         lastPrice: trade.price,
-        startTime: trade.timestamp
+        startTime: trade.timestamp,
+        alerted: false  // 🔥 НОВИЙ ФЛАГ - чи вже відправили алерт
       });
     }
 
@@ -191,6 +200,18 @@ class TradeAggregator {
 
     // Видаляємо старі угоди
     this.cleanup(symbol);
+  }
+
+  hasAlerted(symbol) {
+    const window = this.windows.get(symbol);
+    return window ? window.alerted : false;
+  }
+
+  markAsAlerted(symbol) {
+    const window = this.windows.get(symbol);
+    if (window) {
+      window.alerted = true;
+    }
   }
 
   cleanup(symbol) {
@@ -264,6 +285,18 @@ class TradeAggregator {
 
   reset(symbol) {
     this.windows.delete(symbol);
+  }
+
+  hasAlerted(symbol) {
+    const window = this.windows.get(symbol);
+    return window ? window.alerted : false;
+  }
+
+  markAsAlerted(symbol) {
+    const window = this.windows.get(symbol);
+    if (window) {
+      window.alerted = true;
+    }
   }
 }
 
@@ -426,6 +459,11 @@ class AlertEngine {
   }
 
   async checkAndAlert(symbol, stats, tradeAggregator) {
+    // 🔥 КРИТИЧНО: Перевіряємо чи вже відправили алерт для цього вікна
+    if (tradeAggregator.hasAlerted(symbol)) {
+      return; // Вже відправляли - пропускаємо
+    }
+
     // Перевіряємо умови
     if (!this.signalDetector.shouldAlert(stats)) {
       return;
@@ -447,12 +485,21 @@ class AlertEngine {
     
     try {
       await this.telegram.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message);
+      
+      // ✅ ВАЖЛИВО: Встановлюємо флаг ЩО ВІДПРАВИЛИ для цього вікна
+      tradeAggregator.markAsAlerted(symbol);
+      
+      // Записуємо cooldown
       this.cooldownManager.recordAlert(symbol, stats);
       
-      console.log(`[🚨 АЛЕРТ] ${symbol} - ${interpretation.type} - $${(stats.totalVolumeUSD / 1e6).toFixed(2)}M - ${stats.dominance.toFixed(1)}% - Δ${stats.priceChange.toFixed(2)}%`);
+      console.log(`[🚨 АЛЕРТ] ${symbol} - ${interpretation.type} - ${(stats.totalVolumeUSD / 1e6).toFixed(2)}M - ${stats.dominance.toFixed(1)}% - Δ${stats.priceChange.toFixed(2)}%`);
       
-      // Скидаємо вікно після алерту
-      tradeAggregator.reset(symbol);
+      // Скидаємо вікно через 10 секунд (дає час завершити поточну подію)
+      setTimeout(() => {
+        tradeAggregator.reset(symbol);
+        console.log(`[RESET] ${symbol} - вікно очищено, готовий до нової події`);
+      }, 10000);
+      
     } catch (error) {
       console.error(`[ERROR] Помилка відправки алерту для ${symbol}:`, error.message);
     }
@@ -595,10 +642,10 @@ class BybitWebSocketListener {
           // Додаємо угоду в агрегатор
           this.tradeAggregator.addTrade(symbol, trade);
 
-          // Логуємо тільки великі угоди
-          if (valueUSD >= 50000) {
+          // Логуємо тільки дуже великі угоди (>$100K)
+          if (valueUSD >= 100000) {
             const sideEmoji = side === 'Buy' ? '🟢' : '🔴';
-            console.log(`[TRADE] ${symbol.padEnd(12)} | ${sideEmoji} ${side.padEnd(4)} | $${(valueUSD / 1000).toFixed(1)}K @ $${price.toFixed(2)}`);
+            console.log(`[TRADE] ${symbol.padEnd(12)} | ${sideEmoji} ${side.padEnd(4)} | ${(valueUSD / 1000).toFixed(1)}K @ ${price.toFixed(4)}`);
           }
 
           // Перевіряємо статистику вікна
@@ -702,6 +749,11 @@ class AggressiveVolumeBot {
     console.log(`Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
     console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хвилин`);
     console.log(`Оновлення ринків: кожні ${CONFIG.REFRESH_MARKETS_HOURS} години`);
+    console.log('='.repeat(60));
+    console.log('📌 ВАЖЛИВО: Час у сповіщеннях (~2-5 хвилин) - це НОРМАЛЬНО!');
+    console.log('   Бот чекає поки накопичиться достатній об\'єм у вікні.');
+    console.log('   Для швидших алертів → зменшіть AGGREGATION_WINDOW_SECONDS');
+    console.log('   Але менше вікно = менше якісних сигналів');
     console.log('='.repeat(60));
 
     // Тест Telegram
