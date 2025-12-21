@@ -424,14 +424,6 @@ class BybitWebSocketListener {
     });
 
     this.ws.on('message', (data) => {
-      // Log EVERY message for debugging
-      const message = JSON.parse(data);
-      
-      // Skip only pings
-      if (message.op !== 'pong') {
-        console.log('[WS] 📨 RAW MESSAGE:', JSON.stringify(message).substring(0, 200));
-      }
-      
       this.handleMessage(data);
     });
 
