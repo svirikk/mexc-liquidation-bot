@@ -23,12 +23,6 @@
 // - Якщо хочете швидші алерти → зменшіть AGGREGATION_WINDOW_SECONDS до 60-120с
 // - Але менше вікно = менше накопичується об'єм = менше якісних сигналів
 // - Рекомендовано: 120-300 секунд для балансу швидкості та якості
-//
-// 🔇 КОНТРОЛЬ ЛОГУВАННЯ (Railway 500 logs/sec limit):
-// - За замовчуванням: тільки важливі події (алерти, помилки, система)
-// - SILENT_MODE=true → тільки алерти та помилки
-// - LOG_PROGRESS=false → без прогресу накопичення
-// - DEBUG_MODE=true → всі деталі (використовувати тільки для розробки!)
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -55,11 +49,6 @@ const CONFIG = {
   
   // Обмеження частоти алертів
   MAX_ALERTS_PER_MINUTE: parseInt(process.env.MAX_ALERTS_PER_MINUTE) || 5, // Максимум алертів за хвилину
-  
-  // Режим логування
-  DEBUG_MODE: process.env.DEBUG_MODE === 'true',              // Детальні логи (для розробки)
-  SILENT_MODE: process.env.SILENT_MODE === 'true',            // Тільки алерти та помилки
-  LOG_PROGRESS: process.env.LOG_PROGRESS !== 'false',         // Логувати прогрес накопичення
   
   // Фільтри символів
   MIN_OPEN_INTEREST: parseInt(process.env.MIN_OPEN_INTEREST) || 10_000_000,
@@ -92,7 +81,7 @@ class MarketDataManager {
   }
 
   async fetchAllMarkets() {
-    Logger.system('[API] 📊 Завантаження ринкових даних з Bybit...');
+    console.log('[API] 📊 Завантаження ринкових даних з Bybit...');
     
     try {
       const tickersRes = await axios.get(`${CONFIG.BYBIT_REST_API}/v5/market/tickers`, {
@@ -145,31 +134,31 @@ class MarketDataManager {
         }
       }
 
-      Logger.system(`[API] ✅ Всього ринків: ${tickers.length}`);
-      Logger.system(`[API] 🎯 Відібрано символів: ${eligibleCount}`);
+      console.log(`[API] ✅ Всього ринків: ${tickers.length}`);
+      console.log(`[API] 🎯 Відібрано символів: ${eligibleCount}`);
       
       if (CONFIG.MONITOR_ALL_SYMBOLS) {
-        Logger.system(`[API] 🔥 РЕЖИМ ВІДЛАГОДЖЕННЯ: Моніторинг ВСІХ символів`);
+        console.log(`[API] 🔥 РЕЖИМ ВІДЛАГОДЖЕННЯ: Моніторинг ВСІХ символів`);
       } else {
-        Logger.info(`[API] 📋 Фільтри:`);
-        Logger.info(`      - OI: ${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - ${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-        Logger.info(`      - Мін 24h обсяг: ${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
+        console.log(`[API] 📋 Фільтри:`);
+        console.log(`      - OI: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
+        console.log(`      - Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
       }
 
       if (eligibleCount === 0) {
-        Logger.system(`\n[API] ⚠️ Жоден символ не відповідає критеріям. Топ-10 за OI:`);
+        console.log(`\n[API] ⚠️ Жоден символ не відповідає критеріям. Топ-10 за OI:`);
         allSymbols
           .sort((a, b) => b.oiValue - a.oiValue)
           .slice(0, 10)
           .forEach((s, i) => {
-            Logger.info(`      ${(i + 1).toString().padStart(2)}. ${s.symbol.padEnd(12)} | OI: ${(s.oiValue / 1e6).toFixed(1)}M`);
+            console.log(`      ${(i + 1).toString().padStart(2)}. ${s.symbol.padEnd(12)} | OI: $${(s.oiValue / 1e6).toFixed(1)}M`);
           });
       }
-      Logger.info('');
+      console.log('');
 
       return Array.from(this.eligibleSymbols);
     } catch (error) {
-      Logger.error('[API] ❌ Помилка завантаження: ' + error.message);
+      console.error('[API] ❌ Помилка завантаження:', error.message);
       return [];
     }
   }
@@ -224,7 +213,7 @@ class TradeAggregator {
   markAsAlerted(symbol) {
     this.alertedSymbols.add(symbol);
     this.lastAlertTime.set(symbol, Date.now());
-    Logger.debug(`${symbol} - заблоковано від дублікатів на 30 секунд`);
+    console.log(`[LOCK] ${symbol} - заблоковано від дублікатів на 30 секунд`);
   }
 
   cleanup(symbol) {
@@ -253,7 +242,7 @@ class TradeAggregator {
       if (lastAlert && (now - lastAlert > 30000)) {
         this.alertedSymbols.delete(symbol);
         this.lastAlertTime.delete(symbol);
-        Logger.debug(`${symbol} - розблоковано, готовий до нових алертів`);
+        console.log(`[UNLOCK] ${symbol} - розблоковано, готовий до нових алертів`);
       }
     }
   }
@@ -483,7 +472,7 @@ class AlertEngine {
     
     // Перевіряємо ліміт
     if (this.recentAlerts.length >= CONFIG.MAX_ALERTS_PER_MINUTE) {
-      Logger.debug(`Досягнуто максимум ${CONFIG.MAX_ALERTS_PER_MINUTE} алертів за хвилину`);
+      console.log(`[ЛІМІТ] Досягнуто максимум ${CONFIG.MAX_ALERTS_PER_MINUTE} алертів за хвилину. Чекаємо...`);
       return false;
     }
     
@@ -562,12 +551,12 @@ class BybitWebSocketListener {
   }
 
   async connect() {
-    Logger.system('[WS] 🔌 Підключення до Bybit WebSocket...');
+    console.log('[WS] 🔌 Підключення до Bybit WebSocket...');
     
     this.ws = new WebSocket(CONFIG.BYBIT_WS_PUBLIC);
 
     this.ws.on('open', () => {
-      Logger.system('[WS] ✅ Підключено успішно');
+      console.log('[WS] ✅ Підключено успішно');
       this.reconnectAttempts = 0;
       this.startPingInterval();
       this.subscribeToTrades();
@@ -578,11 +567,11 @@ class BybitWebSocketListener {
     });
 
     this.ws.on('error', (error) => {
-      Logger.error('[WS] Помилка: ' + error.message);
+      console.error('[WS] Помилка:', error.message);
     });
 
     this.ws.on('close', () => {
-      Logger.system('[WS] З\'єднання закрито');
+      console.log('[WS] З\'єднання закрито');
       this.stopPingInterval();
       this.reconnect();
     });
@@ -596,11 +585,11 @@ class BybitWebSocketListener {
     const eligibleSymbols = this.marketDataManager.getEligibleSymbols();
     
     if (eligibleSymbols.length === 0) {
-      Logger.system('[WS] ⚠️ Немає придатних символів для підписки');
+      console.log('[WS] ⚠️ Немає придатних символів для підписки');
       return;
     }
 
-    Logger.system(`[WS] 📡 Підписка на ${eligibleSymbols.length} символів (publicTrade)...`);
+    console.log(`[WS] 📡 Підписка на ${eligibleSymbols.length} символів (publicTrade)...`);
 
     // Підписуємося батчами по 10
     const batchSize = 10;
@@ -616,29 +605,23 @@ class BybitWebSocketListener {
       batch.forEach(symbol => this.subscribedSymbols.add(symbol));
     }
 
-    Logger.system(`[WS] ✅ Підписано на ${eligibleSymbols.length} символів`);
+    console.log(`[WS] ✅ Підписано на ${eligibleSymbols.length} символів`);
+    console.log('[WS] 📊 Перші 15 символів:');
     
-    if (CONFIG.DEBUG_MODE) {
-      Logger.debug('Перші 15 символів:');
-      eligibleSymbols.slice(0, 15).forEach(symbol => {
-        const data = this.marketDataManager.getMarketData(symbol);
-        if (data) {
-          Logger.debug(`  ${symbol.padEnd(15)} | OI: ${(data.oi / 1e6).toFixed(1)}M`);
-        }
-      });
-      if (eligibleSymbols.length > 15) {
-        Logger.debug(`  ... та ще ${eligibleSymbols.length - 15}`);
+    eligibleSymbols.slice(0, 15).forEach(symbol => {
+      const data = this.marketDataManager.getMarketData(symbol);
+      if (data) {
+        console.log(`     ${symbol.padEnd(15)} | OI: $${(data.oi / 1e6).toFixed(1)}M`);
       }
+    });
+    
+    if (eligibleSymbols.length > 15) {
+      console.log(`     ... та ще ${eligibleSymbols.length - 15}`);
     }
     
-    Logger.system(`\n[STATUS] 🎯 Моніторинг активний | Поріг: ${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M | ${CONFIG.MIN_DOMINANCE}% | ${CONFIG.MIN_PRICE_CHANGE}%`);
-    if (CONFIG.SILENT_MODE) {
-      Logger.system('[STATUS] 🔇 SILENT MODE - тільки алерти та помилки\n');
-    } else if (!CONFIG.LOG_PROGRESS) {
-      Logger.system('[STATUS] 🤫 Прогрес вимкнено - тільки алерти\n');
-    } else {
-      Logger.system('[STATUS] 📊 Логування прогресу увімкнено\n');
-    }
+    console.log('\n[STATUS] 🎯 Моніторинг агресивних угод...');
+    console.log(`[STATUS] 💰 Поріг: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M обсяг, ${CONFIG.MIN_DOMINANCE}% домінування, ${CONFIG.MIN_PRICE_CHANGE}% зміна ціни`);
+    console.log('[STATUS] ⏳ Очікування угод...\n');
   }
 
   handleMessage(data) {
@@ -858,10 +841,7 @@ class AggressiveVolumeBot {
 if (require.main === module) {
   const bot = new AggressiveVolumeBot();
   bot.start().catch(error => {
-    Logger.error('[FATAL ERROR] ' + error.message);
-    if (CONFIG.DEBUG_MODE) {
-      Logger.error(error.stack);
-    }
+    console.error('[FATAL ERROR]', error);
     process.exit(1);
   });
 }
