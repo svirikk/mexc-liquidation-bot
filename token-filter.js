@@ -114,30 +114,45 @@ class TokenFilter {
   }
 
   /**
-   * Отримання Open Interest з Binance
+   * Отримання Open Interest з Binance (через ticker з 24hr статистикою)
    */
   async fetchOpenInterest() {
     try {
-      const data = await this.httpsGet('https://fapi.binance.com/fapi/v1/openInterest');
+      // Спочатку отримуємо список всіх символів з OI
+      const tickerData = await this.httpsGet('https://fapi.binance.com/fapi/v1/ticker/24hr');
       
-      if (!Array.isArray(data)) {
-        throw new Error('Некоректний формат даних OI');
+      if (!Array.isArray(tickerData)) {
+        throw new Error('Некоректний формат даних ticker');
       }
 
       const oiMap = {};
       
-      for (const item of data) {
-        if (item.symbol && item.openInterest && item.symbol.endsWith('USDT')) {
-          // Open Interest в контрактах, потрібно помножити на ціну
-          const symbol = item.symbol;
-          const oi = parseFloat(item.openInterest);
-          
-          // Отримуємо ціну для перерахунку в USD
-          const price = await this.getSymbolPrice(symbol);
-          const oiUSD = oi * price;
-          
-          oiMap[symbol] = oiUSD;
+      // Для кожного символу отримуємо його ціну та OI
+      for (const ticker of tickerData) {
+        if (!ticker.symbol || !ticker.symbol.endsWith('USDT')) {
+          continue;
         }
+
+        const symbol = ticker.symbol;
+        const price = parseFloat(ticker.lastPrice) || 0;
+        
+        if (price === 0) continue;
+
+        try {
+          // Отримуємо OI для конкретного символу
+          const oiData = await this.httpsGet(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`);
+          
+          if (oiData && oiData.openInterest) {
+            const oi = parseFloat(oiData.openInterest);
+            const oiUSD = oi * price;
+            oiMap[symbol] = oiUSD;
+          }
+        } catch (err) {
+          // Ігноруємо помилки для окремих символів
+        }
+        
+        // Затримка щоб не перевантажити API (weight limit)
+        await this.sleep(50);
       }
 
       console.log(`[FILTER] OI: отримано ${Object.keys(oiMap).length} токенів`);
@@ -150,23 +165,11 @@ class TokenFilter {
   }
 
   /**
-   * Отримання ціни символу
-   */
-  async getSymbolPrice(symbol) {
-    try {
-      const data = await this.httpsGet(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
-      return parseFloat(data.price) || 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  /**
    * Отримання Market Cap з CoinGecko
    */
   async fetchMarketCap() {
     try {
-      // Отримуємо список всіх монет з ринковими даними
+      // Отримуємо top 250 монет за market cap
       const data = await this.httpsGet(
         'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false'
       );
@@ -195,12 +198,13 @@ class TokenFilter {
   }
 
   /**
-   * HTTPS GET запит
+   * HTTPS GET запит з timeout
    */
-  httpsGet(url) {
+  httpsGet(url, timeout = 10000) {
     return new Promise((resolve, reject) => {
-      https.get(url, {
-        headers: { 'User-Agent': 'Binance-Liquidation-Bot' }
+      const req = https.get(url, {
+        headers: { 'User-Agent': 'Binance-Liquidation-Bot' },
+        timeout: timeout
       }, (res) => {
         let data = '';
         
@@ -213,8 +217,21 @@ class TokenFilter {
             reject(new Error('Помилка парсингу JSON'));
           }
         });
-      }).on('error', reject);
+      });
+
+      req.on('error', reject);
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
     });
+  }
+
+  /**
+   * Затримка (для rate limiting)
+   */
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
