@@ -15,14 +15,6 @@
 // - Визначаємо домінування однієї сторони
 // - Підтверджуємо ціновим імпульсом
 // - Інтерпретуємо це як "примусову ліквідацію"
-//
-// 📊 ПРО ЧАС У ВІКНІ (чому завжди ~300 секунд?):
-// - Це НОРМАЛЬНО! Вікно агрегації = 300с (5 хв) або ваше налаштування
-// - Бот чекає поки накопичиться достатній об'єм ($1M+)
-// - Це зазвичай займає ВЕСЬ період вікна
-// - Якщо хочете швидші алерти → зменшіть AGGREGATION_WINDOW_SECONDS до 60-120с
-// - Але менше вікно = менше накопичується об'єм = менше якісних сигналів
-// - Рекомендовано: 120-300 секунд для балансу швидкості та якості
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -46,9 +38,6 @@ const CONFIG = {
   // Часові вікна
   AGGREGATION_WINDOW_SECONDS: parseInt(process.env.AGGREGATION_WINDOW_SECONDS) || 180, // 3 хвилини
   COOLDOWN_MINUTES: parseInt(process.env.COOLDOWN_MINUTES) || 20,
-  
-  // Обмеження частоти алертів
-  MAX_ALERTS_PER_MINUTE: parseInt(process.env.MAX_ALERTS_PER_MINUTE) || 5, // Максимум алертів за хвилину
   
   // Фільтри символів
   MIN_OPEN_INTEREST: parseInt(process.env.MIN_OPEN_INTEREST) || 10_000_000,
@@ -184,8 +173,6 @@ class MarketDataManager {
 class TradeAggregator {
   constructor() {
     this.windows = new Map(); // symbol -> { trades: [], startPrice, lastPrice, startTime }
-    this.alertedSymbols = new Set(); // 🔥 ОКРЕМИЙ SET для відстежування алертів
-    this.lastAlertTime = new Map(); // symbol -> timestamp останнього алерту
   }
 
   addTrade(symbol, trade) {
@@ -206,16 +193,6 @@ class TradeAggregator {
     this.cleanup(symbol);
   }
 
-  hasAlerted(symbol) {
-    return this.alertedSymbols.has(symbol);
-  }
-
-  markAsAlerted(symbol) {
-    this.alertedSymbols.add(symbol);
-    this.lastAlertTime.set(symbol, Date.now());
-    console.log(`[LOCK] ${symbol} - заблоковано від дублікатів на 30 секунд`);
-  }
-
   cleanup(symbol) {
     const now = Date.now();
     const windowMs = CONFIG.AGGREGATION_WINDOW_SECONDS * 1000;
@@ -226,24 +203,11 @@ class TradeAggregator {
     const filtered = window.trades.filter(t => now - t.timestamp < windowMs);
 
     if (filtered.length === 0) {
-      // Якщо вікно порожнє - видаляємо все
       this.windows.delete(symbol);
-      // Але НЕ видаляємо з alertedSymbols! Це зробить окремий таймер
     } else {
-      // Оновлюємо вікно
       window.trades = filtered;
       window.startTime = filtered[0].timestamp;
       window.startPrice = filtered[0].price;
-    }
-
-    // Очищаємо старі блокування (через 30 секунд після алерту)
-    if (this.alertedSymbols.has(symbol)) {
-      const lastAlert = this.lastAlertTime.get(symbol);
-      if (lastAlert && (now - lastAlert > 30000)) {
-        this.alertedSymbols.delete(symbol);
-        this.lastAlertTime.delete(symbol);
-        console.log(`[UNLOCK] ${symbol} - розблоковано, готовий до нових алертів`);
-      }
     }
   }
 
@@ -300,7 +264,6 @@ class TradeAggregator {
 
   reset(symbol) {
     this.windows.delete(symbol);
-    // alertedSymbols очищається автоматично через 30 секунд у cleanup()
   }
 }
 
@@ -460,35 +423,9 @@ class AlertEngine {
     this.marketDataManager = marketDataManager;
     this.signalDetector = signalDetector;
     this.formatter = new AlertFormatter();
-    this.recentAlerts = []; // Для обмеження кількості алертів
-  }
-
-  canSendAlert() {
-    const now = Date.now();
-    const oneMinuteAgo = now - 60000;
-    
-    // Очищаємо старі записи
-    this.recentAlerts = this.recentAlerts.filter(t => t > oneMinuteAgo);
-    
-    // Перевіряємо ліміт
-    if (this.recentAlerts.length >= CONFIG.MAX_ALERTS_PER_MINUTE) {
-      console.log(`[ЛІМІТ] Досягнуто максимум ${CONFIG.MAX_ALERTS_PER_MINUTE} алертів за хвилину. Чекаємо...`);
-      return false;
-    }
-    
-    return true;
-  }
-
-  recordAlertSent() {
-    this.recentAlerts.push(Date.now());
   }
 
   async checkAndAlert(symbol, stats, tradeAggregator) {
-    // 🔥 КРИТИЧНО: Перевіряємо чи вже відправили алерт для цього вікна
-    if (tradeAggregator.hasAlerted(symbol)) {
-      return; // Вже відправляли - пропускаємо
-    }
-
     // Перевіряємо умови
     if (!this.signalDetector.shouldAlert(stats)) {
       return;
@@ -510,21 +447,12 @@ class AlertEngine {
     
     try {
       await this.telegram.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message);
-      
-      // ✅ ВАЖЛИВО: Встановлюємо флаг ЩО ВІДПРАВИЛИ для цього вікна
-      tradeAggregator.markAsAlerted(symbol);
-      
-      // Записуємо cooldown
       this.cooldownManager.recordAlert(symbol, stats);
       
-      console.log(`[🚨 АЛЕРТ] ${symbol} - ${interpretation.type} - ${(stats.totalVolumeUSD / 1e6).toFixed(2)}M - ${stats.dominance.toFixed(1)}% - Δ${stats.priceChange.toFixed(2)}%`);
+      console.log(`[🚨 АЛЕРТ] ${symbol} - ${interpretation.type} - $${(stats.totalVolumeUSD / 1e6).toFixed(2)}M - ${stats.dominance.toFixed(1)}% - Δ${stats.priceChange.toFixed(2)}%`);
       
-      // Скидаємо вікно через 10 секунд (дає час завершити поточну подію)
-      setTimeout(() => {
-        tradeAggregator.reset(symbol);
-        console.log(`[RESET] ${symbol} - вікно очищено, готовий до нової події`);
-      }, 10000);
-      
+      // Скидаємо вікно після алерту
+      tradeAggregator.reset(symbol);
     } catch (error) {
       console.error(`[ERROR] Помилка відправки алерту для ${symbol}:`, error.message);
     }
@@ -547,7 +475,6 @@ class BybitWebSocketListener {
     this.reconnectDelay = 5000;
     this.pingInterval = null;
     this.subscribedSymbols = new Set();
-    this.lastLogTime = new Map(); // Для дебаунсу логів
   }
 
   async connect() {
@@ -668,10 +595,10 @@ class BybitWebSocketListener {
           // Додаємо угоду в агрегатор
           this.tradeAggregator.addTrade(symbol, trade);
 
-          // Логуємо тільки дуже великі угоди (>$100K)
-          if (valueUSD >= 100000) {
+          // Логуємо тільки великі угоди
+          if (valueUSD >= 50000) {
             const sideEmoji = side === 'Buy' ? '🟢' : '🔴';
-            console.log(`[TRADE] ${symbol.padEnd(12)} | ${sideEmoji} ${side.padEnd(4)} | ${(valueUSD / 1000).toFixed(1)}K @ ${price.toFixed(4)}`);
+            console.log(`[TRADE] ${symbol.padEnd(12)} | ${sideEmoji} ${side.padEnd(4)} | $${(valueUSD / 1000).toFixed(1)}K @ $${price.toFixed(2)}`);
           }
 
           // Перевіряємо статистику вікна
@@ -772,15 +699,9 @@ class AggressiveVolumeBot {
     console.log(`Мін зміна ціни: ${CONFIG.MIN_PRICE_CHANGE}%`);
     console.log(`Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SECONDS}с`);
     console.log(`OI діапазон: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-    console.log(`Min 24h обсяг: ${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
+    console.log(`Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
     console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хвилин`);
-    console.log(`Макс алертів за хвилину: ${CONFIG.MAX_ALERTS_PER_MINUTE}`);
     console.log(`Оновлення ринків: кожні ${CONFIG.REFRESH_MARKETS_HOURS} години`);
-    console.log('='.repeat(60));
-    console.log('📌 ВАЖЛИВО: Час у сповіщеннях (~2-5 хвилин) - це НОРМАЛЬНО!');
-    console.log('   Бот чекає поки накопичиться достатній об\'єм у вікні.');
-    console.log('   Для швидших алертів → зменшіть AGGREGATION_WINDOW_SECONDS');
-    console.log('   Але менше вікно = менше якісних сигналів');
     console.log('='.repeat(60));
 
     // Тест Telegram
