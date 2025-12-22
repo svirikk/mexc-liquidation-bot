@@ -1,663 +1,590 @@
 // ============================================================================
-// BYBIT AGGRESSIVE VOLUME ALERT BOT
-// Відстежування примусових ринкових рухів через агресивний об'єм
+// CRYPTO LIQUIDATION ALERT BOT
+// Detects forced liquidations via aggressive volume dominance
 // ============================================================================
-// 
-// ⚠️ ЧОМУ НЕ ВИКОРИСТОВУЄМО LIQUIDATION STREAMS:
-// 1. Більшість бірж не надають публічні liquidation events в реальному часі
-// 2. Liquidation streams часто затримуються або неповні
-// 3. Насправді важливі не самі ліквідації, а ТИХ НАСЛІДОК - агресивні угоди
-// 4. Аналізуючи publicTrade ми бачимо РЕАЛЬНИЙ тиск на ринок
-// 
-// ✅ ЩО МИ РОБИМО:
-// - Слухаємо публічні угоди (publicTrade)
-// - Агрегуємо об'єми купівлі/продажу в часовому вікні
-// - Визначаємо домінування однієї сторони
-// - Підтверджуємо ціновим імпульсом
-// - Інтерпретуємо це як "примусову ліквідацію"
-// ============================================================================
-
-if (process.env.NODE_ENV !== 'production') {
-  require('dotenv').config();
-}
 
 const WebSocket = require('ws');
-const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const fs = require('fs').promises;
 
 // ============================================================================
-// КОНФІГУРАЦІЯ
+// CONFIGURATION
 // ============================================================================
 
 const CONFIG = {
-  // Пороги для алертів
-  MIN_VOLUME_USD: parseInt(process.env.MIN_VOLUME_USD) || 500_000,        // Мін об'єм для алерту
-  MIN_DOMINANCE: parseFloat(process.env.MIN_DOMINANCE) || 65.0,           // Мін домінування (%)
-  MIN_PRICE_CHANGE: parseFloat(process.env.MIN_PRICE_CHANGE) || 0.5,      // Мін зміна ціни (%)
+  // Bybit API
+  BYBIT_WS: 'wss://stream.bybit.com/v5/public/linear',
+  BYBIT_REST: 'https://api.bybit.com',
   
-  // Часові вікна
-  AGGREGATION_WINDOW_SECONDS: parseInt(process.env.AGGREGATION_WINDOW_SECONDS) || 180, // 3 хвилини
-  COOLDOWN_MINUTES: parseInt(process.env.COOLDOWN_MINUTES) || 20,
+  // Alert thresholds
+  MIN_VOLUME_USD: parseInt(process.env.MIN_VOLUME_USD || '500000'),
+  MIN_DOMINANCE_PCT: parseFloat(process.env.MIN_DOMINANCE_PCT || '65'),
+  MIN_PRICE_CHANGE_PCT: parseFloat(process.env.MIN_PRICE_CHANGE_PCT || '0.5'),
   
-  // Фільтри символів
-  MIN_OPEN_INTEREST: parseInt(process.env.MIN_OPEN_INTEREST) || 10_000_000,
-  MAX_OPEN_INTEREST: parseInt(process.env.MAX_OPEN_INTEREST) || 100_000_000,
-  MIN_VOLUME_24H: parseInt(process.env.MIN_VOLUME_24H) || 5_000_000,
-  
-  // Режим відлагодження (моніторить всі символи)
-  MONITOR_ALL_SYMBOLS: process.env.MONITOR_ALL_SYMBOLS === 'true',
-  
-  // Оновлення ринкових даних
-  REFRESH_MARKETS_HOURS: parseInt(process.env.REFRESH_MARKETS_HOURS) || 2,
-  
-  // API ендпоінти
-  BYBIT_WS_PUBLIC: 'wss://stream.bybit.com/v5/public/linear',
-  BYBIT_REST_API: 'https://api.bybit.com',
+  // Time windows
+  WINDOW_DURATION_SEC: parseInt(process.env.WINDOW_DURATION_SEC || '240'),
+  COOLDOWN_MINUTES: parseInt(process.env.COOLDOWN_MINUTES || '20'),
   
   // Telegram
-  TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
+  
+  // System
+  MAX_SYMBOLS: parseInt(process.env.MAX_SYMBOLS || '1000'),
+  BATCH_SIZE: 10, // Symbols per WS subscription batch
+  BLACKLIST_ENABLED: process.env.BLACKLIST_ENABLED !== 'false',
+  DEBUG_MODE: process.env.DEBUG_MODE === 'true',
+  
+  // Volume increase threshold for same-side alerts during cooldown
+  VOLUME_INCREASE_THRESHOLD: parseFloat(process.env.VOLUME_INCREASE_THRESHOLD || '1.5'),
 };
 
 // ============================================================================
-// МЕНЕДЖЕР РИНКОВИХ ДАНИХ
+// LOGGER
+// ============================================================================
+
+class Logger {
+  static log(message, data = null) {
+    const timestamp = new Date().toISOString();
+    if (data) {
+      console.log(`[${timestamp}] ${message}`, JSON.stringify(data, null, 2));
+    } else {
+      console.log(`[${timestamp}] ${message}`);
+    }
+  }
+  
+  static error(message, error = null) {
+    const timestamp = new Date().toISOString();
+    console.error(`[${timestamp}] ERROR: ${message}`, error || '');
+  }
+  
+  static debug(message, data = null) {
+    if (CONFIG.DEBUG_MODE) {
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] DEBUG: ${message}`, data || '');
+    }
+  }
+}
+
+// ============================================================================
+// MARKET DATA MANAGER
 // ============================================================================
 
 class MarketDataManager {
   constructor() {
-    this.markets = new Map(); // symbol -> { oi, price, volume24h, lastUpdate }
-    this.eligibleSymbols = new Set();
+    this.symbols = new Map(); // symbol -> { oi, volume24h, price }
+    this.blacklist = new Set();
   }
-
-  async fetchAllMarkets() {
-    console.log('[API] 📊 Завантаження ринкових даних з Bybit...');
+  
+  async initialize() {
+    Logger.log('Initializing market data...');
     
+    // Load blacklist
+    if (CONFIG.BLACKLIST_ENABLED) {
+      await this.loadBlacklist();
+    }
+    
+    // Fetch active symbols
+    await this.fetchSymbols();
+    
+    Logger.log(`Market data initialized: ${this.symbols.size} symbols, ${this.blacklist.size} blacklisted`);
+  }
+  
+  async loadBlacklist() {
     try {
-      const tickersRes = await axios.get(`${CONFIG.BYBIT_REST_API}/v5/market/tickers`, {
-        params: { category: 'linear' },
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-          'Accept': 'application/json'
-        },
-        timeout: 15000
-      });
-
-      if (tickersRes.data.retCode !== 0) {
-        throw new Error(`Bybit API error: ${tickersRes.data.retMsg}`);
-      }
-
-      const tickers = tickersRes.data.result.list;
-      let eligibleCount = 0;
-      const allSymbols = [];
-
-      for (const ticker of tickers) {
-        const symbol = ticker.symbol;
-        
-        // Тільки USDT пари
-        if (!symbol.endsWith('USDT')) continue;
-
-        const price = parseFloat(ticker.lastPrice) || 0;
-        const volume24h = parseFloat(ticker.turnover24h) || 0;
-        const oi = parseFloat(ticker.openInterest) || 0;
-        const oiValue = oi * price;
-
-        allSymbols.push({ symbol, oiValue, volume24h, price });
-
-        this.markets.set(symbol, {
-          oi: oiValue,
-          price,
-          volume24h,
-          lastUpdate: Date.now()
-        });
-
-        // Перевірка придатності
-        const isEligible = CONFIG.MONITOR_ALL_SYMBOLS || (
-          oiValue >= CONFIG.MIN_OPEN_INTEREST &&
-          oiValue <= CONFIG.MAX_OPEN_INTEREST &&
-          volume24h >= CONFIG.MIN_VOLUME_24H
-        );
-
-        if (isEligible) {
-          this.eligibleSymbols.add(symbol);
-          eligibleCount++;
-        }
-      }
-
-      console.log(`[API] ✅ Всього ринків: ${tickers.length}`);
-      console.log(`[API] 🎯 Відібрано символів: ${eligibleCount}`);
-      
-      if (CONFIG.MONITOR_ALL_SYMBOLS) {
-        console.log(`[API] 🔥 РЕЖИМ ВІДЛАГОДЖЕННЯ: Моніторинг ВСІХ символів`);
-      } else {
-        console.log(`[API] 📋 Фільтри:`);
-        console.log(`      - OI: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-        console.log(`      - Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
-      }
-
-      if (eligibleCount === 0) {
-        console.log(`\n[API] ⚠️ Жоден символ не відповідає критеріям. Топ-10 за OI:`);
-        allSymbols
-          .sort((a, b) => b.oiValue - a.oiValue)
-          .slice(0, 10)
-          .forEach((s, i) => {
-            console.log(`      ${(i + 1).toString().padStart(2)}. ${s.symbol.padEnd(12)} | OI: $${(s.oiValue / 1e6).toFixed(1)}M`);
-          });
-      }
-      console.log('');
-
-      return Array.from(this.eligibleSymbols);
+      const data = await fs.readFile('blacklist.json', 'utf-8');
+      const list = JSON.parse(data);
+      list.forEach(symbol => this.blacklist.add(symbol));
+      Logger.log(`Blacklist loaded: ${this.blacklist.size} symbols`);
     } catch (error) {
-      console.error('[API] ❌ Помилка завантаження:', error.message);
-      return [];
+      Logger.log('No blacklist.json found or error loading, starting with empty blacklist');
     }
   }
-
-  getMarketData(symbol) {
-    return this.markets.get(symbol);
+  
+  async fetchSymbols() {
+    try {
+      const response = await axios.get(`${CONFIG.BYBIT_REST}/v5/market/tickers`, {
+        params: { category: 'linear' }
+      });
+      
+      const items = response.data.result.list || [];
+      let count = 0;
+      
+      for (const item of items) {
+        if (count >= CONFIG.MAX_SYMBOLS) break;
+        
+        const symbol = item.symbol;
+        
+        // Skip if blacklisted or not USDT perpetual
+        if (this.blacklist.has(symbol) || !symbol.endsWith('USDT')) {
+          continue;
+        }
+        
+        this.symbols.set(symbol, {
+          oi: parseFloat(item.openInterest || 0),
+          volume24h: parseFloat(item.volume24h || 0),
+          price: parseFloat(item.lastPrice || 0)
+        });
+        
+        count++;
+      }
+      
+      Logger.log(`Fetched ${this.symbols.size} active symbols`);
+    } catch (error) {
+      Logger.error('Failed to fetch symbols', error.message);
+      throw error;
+    }
   }
-
-  isEligible(symbol) {
-    return this.eligibleSymbols.has(symbol);
+  
+  isBlacklisted(symbol) {
+    return this.blacklist.has(symbol);
   }
-
-  getEligibleSymbols() {
-    return Array.from(this.eligibleSymbols);
+  
+  getSymbolData(symbol) {
+    return this.symbols.get(symbol);
+  }
+  
+  getActiveSymbols() {
+    return Array.from(this.symbols.keys());
   }
 }
 
 // ============================================================================
-// АГРЕГАТОР УГОД (Trade Aggregator)
+// TRADE AGGREGATOR
 // ============================================================================
-// Це серце системи: збирає угоди в часовому вікні та рахує домінування
 
 class TradeAggregator {
-  constructor() {
-    this.windows = new Map(); // symbol -> { trades: [], startPrice, lastPrice, startTime }
+  constructor(symbol, windowDurationSec) {
+    this.symbol = symbol;
+    this.windowDurationSec = windowDurationSec;
+    this.trades = []; // Array of {timestamp, side, price, size, usdValue}
   }
-
-  addTrade(symbol, trade) {
-    if (!this.windows.has(symbol)) {
-      this.windows.set(symbol, {
-        trades: [],
-        startPrice: trade.price,
-        lastPrice: trade.price,
-        startTime: trade.timestamp
-      });
-    }
-
-    const window = this.windows.get(symbol);
-    window.trades.push(trade);
-    window.lastPrice = trade.price;
-
-    // Видаляємо старі угоди
-    this.cleanup(symbol);
-  }
-
-  cleanup(symbol) {
+  
+  addTrade(trade) {
     const now = Date.now();
-    const windowMs = CONFIG.AGGREGATION_WINDOW_SECONDS * 1000;
-
-    if (!this.windows.has(symbol)) return;
-
-    const window = this.windows.get(symbol);
-    const filtered = window.trades.filter(t => now - t.timestamp < windowMs);
-
-    if (filtered.length === 0) {
-      this.windows.delete(symbol);
-    } else {
-      window.trades = filtered;
-      window.startTime = filtered[0].timestamp;
-      window.startPrice = filtered[0].price;
-    }
+    
+    this.trades.push({
+      timestamp: now,
+      side: trade.side,
+      price: parseFloat(trade.price),
+      size: parseFloat(trade.size),
+      usdValue: parseFloat(trade.price) * parseFloat(trade.size)
+    });
+    
+    // Clean old trades
+    this.cleanup(now);
   }
-
-  getWindowStats(symbol) {
-    if (!this.windows.has(symbol)) return null;
-
-    const window = this.windows.get(symbol);
-    if (window.trades.length === 0) return null;
-
+  
+  cleanup(now) {
+    const cutoff = now - (this.windowDurationSec * 1000);
+    this.trades = this.trades.filter(t => t.timestamp > cutoff);
+  }
+  
+  getAggregation() {
+    if (this.trades.length === 0) {
+      return null;
+    }
+    
+    const now = Date.now();
+    this.cleanup(now);
+    
+    if (this.trades.length === 0) {
+      return null;
+    }
+    
+    let totalVolumeUSD = 0;
     let buyVolumeUSD = 0;
     let sellVolumeUSD = 0;
-
-    // Агрегуємо об'єми
-    for (const trade of window.trades) {
+    
+    const firstTrade = this.trades[0];
+    const lastTrade = this.trades[this.trades.length - 1];
+    
+    for (const trade of this.trades) {
+      totalVolumeUSD += trade.usdValue;
+      
       if (trade.side === 'Buy') {
-        buyVolumeUSD += trade.valueUSD;
+        buyVolumeUSD += trade.usdValue;
       } else {
-        sellVolumeUSD += trade.valueUSD;
+        sellVolumeUSD += trade.usdValue;
       }
     }
-
-    const totalVolumeUSD = buyVolumeUSD + sellVolumeUSD;
-    if (totalVolumeUSD === 0) return null;
-
-    // Рахуємо домінування
-    const buyDominance = (buyVolumeUSD / totalVolumeUSD) * 100;
-    const sellDominance = (sellVolumeUSD / totalVolumeUSD) * 100;
     
+    const dominantVolume = Math.max(buyVolumeUSD, sellVolumeUSD);
+    const dominancePercent = (dominantVolume / totalVolumeUSD) * 100;
     const dominantSide = buyVolumeUSD > sellVolumeUSD ? 'buy' : 'sell';
-    const dominance = Math.max(buyDominance, sellDominance);
-
-    // Зміна ціни
-    const priceChange = ((window.lastPrice - window.startPrice) / window.startPrice) * 100;
-
-    // Тривалість
-    const now = Date.now();
-    const duration = (now - window.startTime) / 1000;
-
+    
+    const priceChangePercent = ((lastTrade.price - firstTrade.price) / firstTrade.price) * 100;
+    const windowDurationSeconds = (lastTrade.timestamp - firstTrade.timestamp) / 1000;
+    
     return {
+      symbol: this.symbol,
+      totalVolumeUSD,
       buyVolumeUSD,
       sellVolumeUSD,
-      totalVolumeUSD,
+      dominancePercent,
       dominantSide,
-      dominance,
-      buyDominance,
-      sellDominance,
-      priceChange,
-      duration,
-      tradeCount: window.trades.length,
-      startPrice: window.startPrice,
-      lastPrice: window.lastPrice
+      priceChangePercent,
+      windowDurationSeconds,
+      tradeCount: this.trades.length,
+      firstPrice: firstTrade.price,
+      lastPrice: lastTrade.price
     };
   }
-
-  reset(symbol) {
-    this.windows.delete(symbol);
-  }
 }
 
 // ============================================================================
-// ДЕТЕКТОР СИГНАЛІВ
+// SIGNAL DETECTOR
 // ============================================================================
-// Перевіряє чи виконані умови для алерту
 
 class SignalDetector {
-  shouldAlert(stats) {
-    if (!stats) return false;
-
-    // Перевірка мінімального об'єму
-    if (stats.totalVolumeUSD < CONFIG.MIN_VOLUME_USD) {
+  static shouldAlert(aggregation, symbolData) {
+    if (!aggregation) return false;
+    
+    // Check volume threshold
+    if (aggregation.totalVolumeUSD < CONFIG.MIN_VOLUME_USD) {
       return false;
     }
-
-    // Перевірка домінування
-    if (stats.dominance < CONFIG.MIN_DOMINANCE) {
+    
+    // Check dominance threshold
+    if (aggregation.dominancePercent < CONFIG.MIN_DOMINANCE_PCT) {
       return false;
     }
-
-    // Перевірка зміни ціни (абсолютне значення)
-    if (Math.abs(stats.priceChange) < CONFIG.MIN_PRICE_CHANGE) {
+    
+    // Check price change threshold
+    if (Math.abs(aggregation.priceChangePercent) < CONFIG.MIN_PRICE_CHANGE_PCT) {
       return false;
     }
-
-    // Додаткова перевірка: зміна ціни має відповідати напрямку домінування
-    // Якщо купівля домінує, ціна має рости (і навпаки)
-    if (stats.dominantSide === 'buy' && stats.priceChange < 0) {
+    
+    // Check price direction matches dominance
+    const priceUp = aggregation.priceChangePercent > 0;
+    const buyDominant = aggregation.dominantSide === 'buy';
+    
+    if (priceUp !== buyDominant) {
       return false;
     }
-    if (stats.dominantSide === 'sell' && stats.priceChange > 0) {
-      return false;
-    }
-
+    
     return true;
   }
-
-  interpretSignal(stats) {
-    // BUY домінує = шорти ліквідуються (примусова купівля)
-    // SELL домінує = лонги ліквідуються (примусовий продаж)
+  
+  static formatAlert(aggregation, symbolData) {
+    const liquidationType = aggregation.dominantSide === 'buy' ? 'SHORTS' : 'LONGS';
+    const volumeStr = this.formatVolume(aggregation.totalVolumeUSD);
+    const durationStr = this.formatDuration(aggregation.windowDurationSeconds);
+    const changeSign = aggregation.priceChangePercent > 0 ? '+' : '';
     
-    if (stats.dominantSide === 'buy') {
-      return {
-        type: 'ШОРТІВ',
-        emoji: '🔥',
-        direction: 'купівля'
-      };
-    } else {
-      return {
-        type: 'ЛОНГІВ',
-        emoji: '🌊',
-        direction: 'продаж'
-      };
+    const baseCurrency = aggregation.symbol.replace('USDT', '');
+    
+    const buyStr = this.formatVolume(aggregation.buyVolumeUSD);
+    const sellStr = this.formatVolume(aggregation.sellVolumeUSD);
+    const oiStr = symbolData ? this.formatVolume(symbolData.oi * symbolData.price) : 'N/A';
+    
+    return `🔥 LIQUIDATION OF ${liquidationType}
+Volume: ${volumeStr} (${durationStr})
+Dominance: ${aggregation.dominancePercent.toFixed(1)}% ${aggregation.dominantSide.toUpperCase()}
+————————————
+🔥 ${baseCurrency}USDT #${baseCurrency}
+Price change: ${changeSign}${aggregation.priceChangePercent.toFixed(2)}%
+Buy: ${buyStr}
+Sell: ${sellStr}
+OI: ${oiStr}`;
+  }
+  
+  static formatVolume(value) {
+    if (value >= 1000000) {
+      return `$${(value / 1000000).toFixed(2)}M`;
     }
+    return `$${(value / 1000).toFixed(0)}K`;
+  }
+  
+  static formatDuration(seconds) {
+    const minutes = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${minutes}m ${secs.toString().padStart(2, '0')}s`;
   }
 }
 
 // ============================================================================
-// МЕНЕДЖЕР COOLDOWN
+// COOLDOWN MANAGER
 // ============================================================================
 
 class CooldownManager {
   constructor(cooldownMinutes) {
-    this.cooldowns = new Map();
     this.cooldownMs = cooldownMinutes * 60 * 1000;
+    this.lastAlerts = new Map(); // symbol -> { timestamp, side, volume }
   }
-
-  canAlert(symbol, stats) {
-    if (!this.cooldowns.has(symbol)) {
+  
+  canAlert(symbol, aggregation) {
+    const lastAlert = this.lastAlerts.get(symbol);
+    
+    if (!lastAlert) {
       return true;
     }
-
-    const lastAlert = this.cooldowns.get(symbol);
-    const now = Date.now();
     
-    if (now - lastAlert.timestamp < this.cooldownMs) {
-      // Дозволяємо новий алерт якщо об'єм значно більший або інша сторона
-      const volumeIncrease = stats.totalVolumeUSD / lastAlert.volume;
-      const sameSide = stats.dominantSide === lastAlert.side;
-      
-      if (sameSide && volumeIncrease < 1.5) {
-        return false;
+    const now = Date.now();
+    const timeSinceLastAlert = now - lastAlert.timestamp;
+    
+    // Cooldown not expired
+    if (timeSinceLastAlert < this.cooldownMs) {
+      // Allow if opposite side
+      if (lastAlert.side !== aggregation.dominantSide) {
+        return true;
       }
+      
+      // Allow if volume significantly increased
+      const volumeRatio = aggregation.totalVolumeUSD / lastAlert.volume;
+      if (volumeRatio >= CONFIG.VOLUME_INCREASE_THRESHOLD) {
+        return true;
+      }
+      
+      return false;
     }
-
+    
+    // Cooldown expired
     return true;
   }
-
-  recordAlert(symbol, stats) {
-    this.cooldowns.set(symbol, {
+  
+  recordAlert(symbol, aggregation) {
+    this.lastAlerts.set(symbol, {
       timestamp: Date.now(),
-      volume: stats.totalVolumeUSD,
-      side: stats.dominantSide
+      side: aggregation.dominantSide,
+      volume: aggregation.totalVolumeUSD
+    });
+  }
+  
+  cleanup() {
+    const now = Date.now();
+    const cutoff = now - (this.cooldownMs * 2); // Keep 2x cooldown period
+    
+    for (const [symbol, data] of this.lastAlerts.entries()) {
+      if (data.timestamp < cutoff) {
+        this.lastAlerts.delete(symbol);
+      }
+    }
+  }
+}
+
+// ============================================================================
+// ALERT ENGINE
+// ============================================================================
+
+class AlertEngine {
+  constructor() {
+    this.telegramEnabled = !!(CONFIG.TELEGRAM_BOT_TOKEN && CONFIG.TELEGRAM_CHAT_ID);
+    this.alertQueue = [];
+    this.sending = false;
+  }
+  
+  async sendAlert(message) {
+    if (!this.telegramEnabled) {
+      Logger.log('ALERT (Telegram disabled):', message);
+      return;
+    }
+    
+    this.alertQueue.push(message);
+    this.processQueue();
+  }
+  
+  async processQueue() {
+    if (this.sending || this.alertQueue.length === 0) {
+      return;
+    }
+    
+    this.sending = true;
+    
+    while (this.alertQueue.length > 0) {
+      const message = this.alertQueue.shift();
+      
+      try {
+        await this.sendTelegram(message);
+        Logger.log('Alert sent successfully');
+        
+        // Rate limit: 1 message per 2 seconds
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (error) {
+        Logger.error('Failed to send alert', error.message);
+        // Don't retry, move to next message
+      }
+    }
+    
+    this.sending = false;
+  }
+  
+  async sendTelegram(message) {
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    
+    await axios.post(url, {
+      chat_id: CONFIG.TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: 'HTML'
+    }, {
+      timeout: 10000
     });
   }
 }
 
 // ============================================================================
-// ФОРМАТЕР АЛЕРТІВ
+// WEBSOCKET MANAGER
 // ============================================================================
 
-class AlertFormatter {
-  format(symbol, stats, interpretation, marketData) {
-    const lines = [];
-    
-    lines.push(`${interpretation.emoji} ЛІКВІДАЦІЯ ${interpretation.type}`);
-    lines.push(`Об'єм: $${this.formatNumber(stats.totalVolumeUSD)} (${this.formatDuration(stats.duration)})`);
-    lines.push(`Домінування: ${stats.dominance.toFixed(1)}% ${interpretation.direction.toUpperCase()}`);
-    lines.push('—————————————————');
-    
-    const cleanSymbol = symbol.replace('USDT', '');
-    lines.push(`🔥 ${symbol} #${cleanSymbol}`);
-    
-    const priceChangeSign = stats.priceChange >= 0 ? '+' : '';
-    lines.push(`⏱ Зміна ціни: ${priceChangeSign}${stats.priceChange.toFixed(2)}%`);
-    
-    lines.push('💥 Агресивний об\'єм:');
-    lines.push(`🟢 Купівля: $${this.formatNumber(stats.buyVolumeUSD)}`);
-    lines.push(`🔴 Продаж: $${this.formatNumber(stats.sellVolumeUSD)}`);
-    
-    if (marketData) {
-      lines.push('—————————————————');
-      lines.push(`💸 OI: $${this.formatNumber(marketData.oi)}`);
-      lines.push(`📊 Поточна ціна: $${marketData.price.toFixed(4)}`);
-    }
-    
-    return lines.join('\n');
-  }
-
-  formatNumber(num) {
-    if (num >= 1_000_000) {
-      return (num / 1_000_000).toFixed(2) + 'M';
-    }
-    if (num >= 1_000) {
-      return (num / 1_000).toFixed(0) + 'K';
-    }
-    return num.toFixed(0);
-  }
-
-  formatDuration(seconds) {
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins}хв ${secs}с`;
-  }
-}
-
-// ============================================================================
-// ДВИЖОК АЛЕРТІВ
-// ============================================================================
-
-class AlertEngine {
-  constructor(telegram, cooldownManager, marketDataManager, signalDetector) {
-    this.telegram = telegram;
+class WebSocketManager {
+  constructor(marketData, aggregators, cooldownManager, alertEngine) {
+    this.marketData = marketData;
+    this.aggregators = aggregators;
     this.cooldownManager = cooldownManager;
-    this.marketDataManager = marketDataManager;
-    this.signalDetector = signalDetector;
-    this.formatter = new AlertFormatter();
-  }
-
-  async checkAndAlert(symbol, stats, tradeAggregator) {
-    // Перевіряємо умови
-    if (!this.signalDetector.shouldAlert(stats)) {
-      return;
-    }
-
-    // Перевіряємо cooldown
-    if (!this.cooldownManager.canAlert(symbol, stats)) {
-      return;
-    }
-
-    // Отримуємо інтерпретацію
-    const interpretation = this.signalDetector.interpretSignal(stats);
-
-    // Отримуємо ринкові дані
-    const marketData = this.marketDataManager.getMarketData(symbol);
-
-    // Форматуємо та відправляємо
-    const message = this.formatter.format(symbol, stats, interpretation, marketData);
-    
-    try {
-      await this.telegram.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message);
-      this.cooldownManager.recordAlert(symbol, stats);
-      
-      console.log(`[🚨 АЛЕРТ] ${symbol} - ${interpretation.type} - $${(stats.totalVolumeUSD / 1e6).toFixed(2)}M - ${stats.dominance.toFixed(1)}% - Δ${stats.priceChange.toFixed(2)}%`);
-      
-      // Скидаємо вікно після алерту
-      tradeAggregator.reset(symbol);
-    } catch (error) {
-      console.error(`[ERROR] Помилка відправки алерту для ${symbol}:`, error.message);
-    }
-  }
-}
-
-// ============================================================================
-// BYBIT WEBSOCKET (PUBLICТRADE)
-// ============================================================================
-// Слухаємо публічні угоди, а не ліквідації!
-
-class BybitWebSocketListener {
-  constructor(tradeAggregator, alertEngine, marketDataManager) {
-    this.tradeAggregator = tradeAggregator;
     this.alertEngine = alertEngine;
-    this.marketDataManager = marketDataManager;
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 5000;
     this.pingInterval = null;
-    this.subscribedSymbols = new Set();
+    this.subscribed = false;
   }
-
-  async connect() {
-    console.log('[WS] 🔌 Підключення до Bybit WebSocket...');
+  
+  connect() {
+    Logger.log('Connecting to Bybit WebSocket...');
     
-    this.ws = new WebSocket(CONFIG.BYBIT_WS_PUBLIC);
-
+    this.ws = new WebSocket(CONFIG.BYBIT_WS);
+    
     this.ws.on('open', () => {
-      console.log('[WS] ✅ Підключено успішно');
+      Logger.log('WebSocket connected');
       this.reconnectAttempts = 0;
-      this.startPingInterval();
-      this.subscribeToTrades();
+      this.subscribed = false;
+      this.subscribe();
+      this.startPing();
     });
-
+    
     this.ws.on('message', (data) => {
       this.handleMessage(data);
     });
-
+    
     this.ws.on('error', (error) => {
-      console.error('[WS] Помилка:', error.message);
+      Logger.error('WebSocket error', error.message);
     });
-
+    
     this.ws.on('close', () => {
-      console.log('[WS] З\'єднання закрито');
-      this.stopPingInterval();
+      Logger.log('WebSocket closed');
+      this.stopPing();
       this.reconnect();
     });
   }
-
-  subscribeToTrades() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const eligibleSymbols = this.marketDataManager.getEligibleSymbols();
+  
+  subscribe() {
+    if (this.subscribed) return;
     
-    if (eligibleSymbols.length === 0) {
-      console.log('[WS] ⚠️ Немає придатних символів для підписки');
-      return;
-    }
-
-    console.log(`[WS] 📡 Підписка на ${eligibleSymbols.length} символів (publicTrade)...`);
-
-    // Підписуємося батчами по 10
-    const batchSize = 10;
-    for (let i = 0; i < eligibleSymbols.length; i += batchSize) {
-      const batch = eligibleSymbols.slice(i, i + batchSize);
-      const topics = batch.map(symbol => `publicTrade.${symbol}`);
+    const symbols = this.marketData.getActiveSymbols();
+    Logger.log(`Subscribing to ${symbols.length} symbols...`);
+    
+    // Subscribe in batches
+    for (let i = 0; i < symbols.length; i += CONFIG.BATCH_SIZE) {
+      const batch = symbols.slice(i, i + CONFIG.BATCH_SIZE);
+      const topics = batch.map(s => `publicTrade.${s}`);
       
-      this.ws.send(JSON.stringify({
+      const subscribeMsg = {
         op: 'subscribe',
         args: topics
-      }));
-
-      batch.forEach(symbol => this.subscribedSymbols.add(symbol));
-    }
-
-    console.log(`[WS] ✅ Підписано на ${eligibleSymbols.length} символів`);
-    console.log('[WS] 📊 Перші 15 символів:');
-    
-    eligibleSymbols.slice(0, 15).forEach(symbol => {
-      const data = this.marketDataManager.getMarketData(symbol);
-      if (data) {
-        console.log(`     ${symbol.padEnd(15)} | OI: $${(data.oi / 1e6).toFixed(1)}M`);
-      }
-    });
-    
-    if (eligibleSymbols.length > 15) {
-      console.log(`     ... та ще ${eligibleSymbols.length - 15}`);
+      };
+      
+      setTimeout(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(subscribeMsg));
+        }
+      }, i * 100); // 100ms between batches
     }
     
-    console.log('\n[STATUS] 🎯 Моніторинг агресивних угод...');
-    console.log(`[STATUS] 💰 Поріг: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M обсяг, ${CONFIG.MIN_DOMINANCE}% домінування, ${CONFIG.MIN_PRICE_CHANGE}% зміна ціни`);
-    console.log('[STATUS] ⏳ Очікування угод...\n');
+    this.subscribed = true;
+    Logger.log('Subscription requests sent');
   }
-
+  
   handleMessage(data) {
     try {
       const message = JSON.parse(data);
       
-      // Pong
+      // Subscription confirmation
+      if (message.op === 'subscribe' && message.success) {
+        Logger.debug('Subscription confirmed');
+        return;
+      }
+      
+      // Pong response
       if (message.op === 'pong') {
         return;
       }
-
-      // Підтвердження підписки
-      if (message.success === true) {
-        return;
-      }
-
-      // Публічні угоди
-      if (message.topic && message.topic.startsWith('publicTrade.')) {
-        const symbol = message.topic.replace('publicTrade.', '');
-        
-        // Тільки придатні символи
-        if (!this.marketDataManager.isEligible(symbol)) {
-          return;
-        }
-
-        // Обробляємо кожну угоду в масиві data
-        const trades = Array.isArray(message.data) ? message.data : [message.data];
-        
-        for (const rawTrade of trades) {
-          const price = parseFloat(rawTrade.p);
-          const size = parseFloat(rawTrade.v);
-          const side = rawTrade.S; // 'Buy' або 'Sell'
-          const timestamp = parseInt(rawTrade.T);
-          const valueUSD = price * size;
-
-          const trade = {
-            price,
-            size,
-            side,
-            timestamp,
-            valueUSD
-          };
-
-          // Додаємо угоду в агрегатор
-          this.tradeAggregator.addTrade(symbol, trade);
-
-          // Логуємо тільки великі угоди
-          if (valueUSD >= 50000) {
-            const sideEmoji = side === 'Buy' ? '🟢' : '🔴';
-            console.log(`[TRADE] ${symbol.padEnd(12)} | ${sideEmoji} ${side.padEnd(4)} | $${(valueUSD / 1000).toFixed(1)}K @ $${price.toFixed(2)}`);
-          }
-
-          // Перевіряємо статистику вікна
-          const stats = this.tradeAggregator.getWindowStats(symbol);
-          if (stats && stats.totalVolumeUSD >= CONFIG.MIN_VOLUME_USD * 0.5) {
-            // Логуємо прогрес
-            const domType = stats.dominantSide === 'buy' ? '🟢 BUY' : '🔴 SELL';
-            console.log(`[WINDOW] ${symbol.padEnd(12)} | Всього: $${(stats.totalVolumeUSD / 1000).toFixed(1)}K | ${domType} ${stats.dominance.toFixed(1)}% | Ціна: ${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(2)}% | ${stats.duration.toFixed(0)}с`);
-            
-            // Перевіряємо чи готові до алерту
-            this.alertEngine.checkAndAlert(symbol, stats, this.tradeAggregator);
-          }
-        }
-      }
       
+      // Trade data
+      if (message.topic && message.topic.startsWith('publicTrade.')) {
+        this.handleTrade(message);
+      }
     } catch (error) {
-      console.error('[ERROR] Помилка обробки повідомлення:', error.message);
+      Logger.debug('Message parse error', error.message);
     }
   }
-
-  startPingInterval() {
+  
+  handleTrade(message) {
+    const symbol = message.topic.replace('publicTrade.', '');
+    
+    if (this.marketData.isBlacklisted(symbol)) {
+      return;
+    }
+    
+    const trades = message.data || [];
+    
+    for (const trade of trades) {
+      const aggregator = this.aggregators.get(symbol);
+      if (!aggregator) continue;
+      
+      aggregator.addTrade(trade);
+      
+      // Check for signal
+      const aggregation = aggregator.getAggregation();
+      if (!aggregation) continue;
+      
+      const symbolData = this.marketData.getSymbolData(symbol);
+      
+      if (SignalDetector.shouldAlert(aggregation, symbolData)) {
+        if (this.cooldownManager.canAlert(symbol, aggregation)) {
+          const alertMessage = SignalDetector.formatAlert(aggregation, symbolData);
+          this.alertEngine.sendAlert(alertMessage);
+          this.cooldownManager.recordAlert(symbol, aggregation);
+          
+          Logger.log(`ALERT: ${symbol} - ${aggregation.dominantSide.toUpperCase()} dominance ${aggregation.dominancePercent.toFixed(1)}%`);
+        }
+      }
+    }
+  }
+  
+  startPing() {
     this.pingInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ op: 'ping' }));
       }
-    }, 20000);
+    }, 20000); // Ping every 20 seconds
   }
-
-  stopPingInterval() {
+  
+  stopPing() {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
     }
   }
-
+  
   reconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[WS] Досягнуто максимум спроб переподключення');
-      return;
+      Logger.error('Max reconnect attempts reached. Exiting...');
+      process.exit(1);
     }
-
+    
     this.reconnectAttempts++;
-    console.log(`[WS] Переподключення через ${this.reconnectDelay / 1000}с... (спроба ${this.reconnectAttempts})`);
+    const delay = this.reconnectDelay * this.reconnectAttempts;
+    
+    Logger.log(`Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
     
     setTimeout(() => {
       this.connect();
-    }, this.reconnectDelay);
+    }, delay);
   }
-
-  async resubscribe() {
-    console.log('[WS] Оновлення підписок...');
-    this.subscribedSymbols.clear();
-    
-    await this.marketDataManager.fetchAllMarkets();
-    this.subscribeToTrades();
-  }
-
+  
   close() {
-    this.stopPingInterval();
+    this.stopPing();
     if (this.ws) {
       this.ws.close();
     }
@@ -665,106 +592,124 @@ class BybitWebSocketListener {
 }
 
 // ============================================================================
-// ГОЛОВНИЙ ДОДАТОК
+// MAIN APPLICATION
 // ============================================================================
 
-class AggressiveVolumeBot {
+class CryptoAlertBot {
   constructor() {
-    this.telegram = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
-    this.marketDataManager = new MarketDataManager();
-    this.tradeAggregator = new TradeAggregator();
-    this.signalDetector = new SignalDetector();
-    this.cooldownManager = new CooldownManager(CONFIG.COOLDOWN_MINUTES);
-    this.alertEngine = new AlertEngine(
-      this.telegram,
-      this.cooldownManager,
-      this.marketDataManager,
-      this.signalDetector
-    );
-    this.wsListener = new BybitWebSocketListener(
-      this.tradeAggregator,
-      this.alertEngine,
-      this.marketDataManager
-    );
-    this.refreshInterval = null;
+    this.marketData = null;
+    this.aggregators = new Map();
+    this.cooldownManager = null;
+    this.alertEngine = null;
+    this.wsManager = null;
+    this.cleanupInterval = null;
   }
-
+  
   async start() {
-    console.log('='.repeat(60));
-    console.log('BYBIT AGGRESSIVE VOLUME ALERT BOT');
-    console.log('Відстеження примусових рухів через агресивні угоди');
-    console.log('='.repeat(60));
-    console.log(`Мін об'єм для алерту: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M`);
-    console.log(`Мін домінування: ${CONFIG.MIN_DOMINANCE}%`);
-    console.log(`Мін зміна ціни: ${CONFIG.MIN_PRICE_CHANGE}%`);
-    console.log(`Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SECONDS}с`);
-    console.log(`OI діапазон: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-    console.log(`Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
-    console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хвилин`);
-    console.log(`Оновлення ринків: кожні ${CONFIG.REFRESH_MARKETS_HOURS} години`);
-    console.log('='.repeat(60));
-
-    // Тест Telegram
-    try {
-      await this.telegram.sendMessage(
-        CONFIG.TELEGRAM_CHAT_ID,
-        '🚀 Bybit Aggressive Volume Bot Запущено\n\n✅ Відстеження агресивних ринкових угод активне!'
-      );
-      console.log('[TELEGRAM] ✅ З\'єднання успішне\n');
-    } catch (error) {
-      console.error('[TELEGRAM] ❌ Помилка підключення:', error.message);
-      process.exit(1);
-    }
-
-    // Завантажуємо ринкові дані
-    await this.marketDataManager.fetchAllMarkets();
-
-    // Підключаємо WebSocket
-    await this.wsListener.connect();
-
-    // Запускаємо періодичне оновлення
-    this.startMarketRefresh();
-
-    // Обробники завершення
-    process.on('SIGINT', () => this.shutdown());
-    process.on('SIGTERM', () => this.shutdown());
-  }
-
-  startMarketRefresh() {
-    this.refreshInterval = setInterval(async () => {
-      console.log('\n[REFRESH] 🔄 Оновлення ринкових даних...');
-      await this.wsListener.resubscribe();
-    }, CONFIG.REFRESH_MARKETS_HOURS * 60 * 60 * 1000);
-  }
-
-  async shutdown() {
-    console.log('\n[SHUTDOWN] Зупинка бота...');
+    Logger.log('='.repeat(60));
+    Logger.log('CRYPTO LIQUIDATION ALERT BOT');
+    Logger.log('='.repeat(60));
+    Logger.log('Configuration:', {
+      minVolumeUSD: CONFIG.MIN_VOLUME_USD,
+      minDominancePct: CONFIG.MIN_DOMINANCE_PCT,
+      minPriceChangePct: CONFIG.MIN_PRICE_CHANGE_PCT,
+      windowDurationSec: CONFIG.WINDOW_DURATION_SEC,
+      cooldownMinutes: CONFIG.COOLDOWN_MINUTES,
+      maxSymbols: CONFIG.MAX_SYMBOLS,
+      blacklistEnabled: CONFIG.BLACKLIST_ENABLED,
+      telegramEnabled: !!(CONFIG.TELEGRAM_BOT_TOKEN && CONFIG.TELEGRAM_CHAT_ID)
+    });
+    Logger.log('='.repeat(60));
     
-    if (this.refreshInterval) {
-      clearInterval(this.refreshInterval);
+    // Initialize components
+    this.marketData = new MarketDataManager();
+    await this.marketData.initialize();
+    
+    // Create aggregators for each symbol
+    const symbols = this.marketData.getActiveSymbols();
+    for (const symbol of symbols) {
+      this.aggregators.set(symbol, new TradeAggregator(symbol, CONFIG.WINDOW_DURATION_SEC));
     }
     
-    this.wsListener.close();
+    this.cooldownManager = new CooldownManager(CONFIG.COOLDOWN_MINUTES);
+    this.alertEngine = new AlertEngine();
     
-    await this.telegram.sendMessage(
-      CONFIG.TELEGRAM_CHAT_ID,
-      '⛔ Bybit Aggressive Volume Bot Зупинено'
+    // Start WebSocket
+    this.wsManager = new WebSocketManager(
+      this.marketData,
+      this.aggregators,
+      this.cooldownManager,
+      this.alertEngine
     );
+    this.wsManager.connect();
     
-    process.exit(0);
+    // Periodic cleanup
+    this.cleanupInterval = setInterval(() => {
+      this.cooldownManager.cleanup();
+    }, 60000); // Every minute
+    
+    Logger.log('Bot started successfully');
+    Logger.log('='.repeat(60));
+  }
+  
+  stop() {
+    Logger.log('Shutting down bot...');
+    
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
+    
+    if (this.wsManager) {
+      this.wsManager.close();
+    }
+    
+    Logger.log('Bot stopped');
   }
 }
 
 // ============================================================================
-// ЗАПУСК БОТА
+// ENTRY POINT
 // ============================================================================
 
-if (require.main === module) {
-  const bot = new AggressiveVolumeBot();
-  bot.start().catch(error => {
-    console.error('[FATAL ERROR]', error);
+async function main() {
+  const bot = new CryptoAlertBot();
+  
+  // Graceful shutdown
+  process.on('SIGINT', () => {
+    Logger.log('Received SIGINT signal');
+    bot.stop();
+    process.exit(0);
+  });
+  
+  process.on('SIGTERM', () => {
+    Logger.log('Received SIGTERM signal');
+    bot.stop();
+    process.exit(0);
+  });
+  
+  process.on('uncaughtException', (error) => {
+    Logger.error('Uncaught exception', error);
+    bot.stop();
     process.exit(1);
   });
+  
+  process.on('unhandledRejection', (error) => {
+    Logger.error('Unhandled rejection', error);
+    bot.stop();
+    process.exit(1);
+  });
+  
+  try {
+    await bot.start();
+  } catch (error) {
+    Logger.error('Failed to start bot', error);
+    process.exit(1);
+  }
 }
 
-module.exports = { AggressiveVolumeBot };
+// Run if this is the main module
+if (require.main === module) {
+  main();
+}
+
+module.exports = { CryptoAlertBot, CONFIG };
