@@ -1,5 +1,5 @@
 // ============================================================================
-// BYBIT AGGRESSIVE VOLUME ALERT BOT
+// MEXC AGGRESSIVE VOLUME ALERT BOT
 // Відстежування примусових ринкових рухів через агресивний об'єм
 // ============================================================================
 // 
@@ -10,7 +10,7 @@
 // 4. Аналізуючи publicTrade ми бачимо РЕАЛЬНИЙ тиск на ринок
 // 
 // ✅ ЩО МИ РОБИМО:
-// - Слухаємо публічні угоди (publicTrade)
+// - Слухаємо публічні угоди (push.deal)
 // - Агрегуємо об'єми купівлі/продажу в часовому вікні
 // - Визначаємо домінування однієї сторони
 // - Підтверджуємо ціновим імпульсом
@@ -51,8 +51,8 @@ const CONFIG = {
   REFRESH_MARKETS_HOURS: parseInt(process.env.REFRESH_MARKETS_HOURS) || 2,
   
   // API ендпоінти
-  BYBIT_WS_PUBLIC: 'wss://stream.bybit.com/v5/public/linear',
-  BYBIT_REST_API: 'https://api.bybit.com',
+  MEXC_WS_FUTURES: 'wss://contract.mexc.com/edge',
+  MEXC_REST_API: 'https://contract.mexc.com',
   
   // Telegram
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
@@ -65,16 +65,16 @@ const CONFIG = {
 
 class MarketDataManager {
   constructor() {
-    this.markets = new Map(); // symbol -> { oi, price, volume24h, lastUpdate }
+    this.markets = new Map(); // symbol -> { oi, price, volume24h, contractSize, lastUpdate }
     this.eligibleSymbols = new Set();
   }
 
   async fetchAllMarkets() {
-    console.log('[API] 📊 Завантаження ринкових даних з Bybit...');
+    console.log('[API] 📊 Завантаження ринкових даних з MEXC...');
     
     try {
-      const tickersRes = await axios.get(`${CONFIG.BYBIT_REST_API}/v5/market/tickers`, {
-        params: { category: 'linear' },
+      // Отримуємо всі тікери
+      const tickersRes = await axios.get(`${CONFIG.MEXC_REST_API}/api/v1/contract/ticker`, {
         headers: {
           'User-Agent': 'Mozilla/5.0',
           'Accept': 'application/json'
@@ -82,11 +82,11 @@ class MarketDataManager {
         timeout: 15000
       });
 
-      if (tickersRes.data.retCode !== 0) {
-        throw new Error(`Bybit API error: ${tickersRes.data.retMsg}`);
+      if (!tickersRes.data.success) {
+        throw new Error(`MEXC API error: ${tickersRes.data.message || 'Unknown error'}`);
       }
 
-      const tickers = tickersRes.data.result.list;
+      const tickers = tickersRes.data.data;
       let eligibleCount = 0;
       const allSymbols = [];
 
@@ -94,19 +94,24 @@ class MarketDataManager {
         const symbol = ticker.symbol;
         
         // Тільки USDT пари
-        if (!symbol.endsWith('USDT')) continue;
+        if (!symbol.endsWith('_USDT')) continue;
 
         const price = parseFloat(ticker.lastPrice) || 0;
-        const volume24h = parseFloat(ticker.turnover24h) || 0;
-        const oi = parseFloat(ticker.openInterest) || 0;
-        const oiValue = oi * price;
+        const volume24 = parseFloat(ticker.amount24) || 0; // amount24 - це об'єм в USD
+        const holdVol = parseFloat(ticker.holdVol) || 0; // holdVol - це open interest в контрактах
+        const contractSize = parseFloat(ticker.contractSize || 0.0001); // розмір контракту
+        
+        // OI в USD = holdVol * contractSize * price
+        const oiValue = holdVol * contractSize * price;
 
-        allSymbols.push({ symbol, oiValue, volume24h, price });
+        allSymbols.push({ symbol, oiValue, volume24h: volume24, price });
 
         this.markets.set(symbol, {
           oi: oiValue,
           price,
-          volume24h,
+          volume24h: volume24,
+          contractSize,
+          holdVol,
           lastUpdate: Date.now()
         });
 
@@ -114,7 +119,7 @@ class MarketDataManager {
         const isEligible = CONFIG.MONITOR_ALL_SYMBOLS || (
           oiValue >= CONFIG.MIN_OPEN_INTEREST &&
           oiValue <= CONFIG.MAX_OPEN_INTEREST &&
-          volume24h >= CONFIG.MIN_VOLUME_24H
+          volume24 >= CONFIG.MIN_VOLUME_24H
         );
 
         if (isEligible) {
@@ -376,7 +381,7 @@ class AlertFormatter {
     lines.push(`Домінування: ${stats.dominance.toFixed(1)}% ${interpretation.direction.toUpperCase()}`);
     lines.push('—————————————————');
     
-    const cleanSymbol = symbol.replace('USDT', '');
+    const cleanSymbol = symbol.replace('_USDT', '');
     lines.push(`🔥 ${symbol} #${cleanSymbol}`);
     
     const priceChangeSign = stats.priceChange >= 0 ? '+' : '';
@@ -460,11 +465,11 @@ class AlertEngine {
 }
 
 // ============================================================================
-// BYBIT WEBSOCKET (PUBLICТRADE)
+// MEXC WEBSOCKET (PUSH.DEAL)
 // ============================================================================
-// Слухаємо публічні угоди, а не ліквідації!
+// Слухаємо публічні угоди через push.deal канал
 
-class BybitWebSocketListener {
+class MexcWebSocketListener {
   constructor(tradeAggregator, alertEngine, marketDataManager) {
     this.tradeAggregator = tradeAggregator;
     this.alertEngine = alertEngine;
@@ -478,9 +483,9 @@ class BybitWebSocketListener {
   }
 
   async connect() {
-    console.log('[WS] 🔌 Підключення до Bybit WebSocket...');
+    console.log('[WS] 🔌 Підключення до MEXC WebSocket...');
     
-    this.ws = new WebSocket(CONFIG.BYBIT_WS_PUBLIC);
+    this.ws = new WebSocket(CONFIG.MEXC_WS_FUTURES);
 
     this.ws.on('open', () => {
       console.log('[WS] ✅ Підключено успішно');
@@ -516,20 +521,19 @@ class BybitWebSocketListener {
       return;
     }
 
-    console.log(`[WS] 📡 Підписка на ${eligibleSymbols.length} символів (publicTrade)...`);
+    console.log(`[WS] 📡 Підписка на ${eligibleSymbols.length} символів (push.deal)...`);
 
-    // Підписуємося батчами по 10
-    const batchSize = 10;
-    for (let i = 0; i < eligibleSymbols.length; i += batchSize) {
-      const batch = eligibleSymbols.slice(i, i + batchSize);
-      const topics = batch.map(symbol => `publicTrade.${symbol}`);
+    // Підписуємося на кожен символ окремо
+    for (const symbol of eligibleSymbols) {
+      const subscribeMessage = {
+        method: 'sub.deal',
+        param: {
+          symbol: symbol
+        }
+      };
       
-      this.ws.send(JSON.stringify({
-        op: 'subscribe',
-        args: topics
-      }));
-
-      batch.forEach(symbol => this.subscribedSymbols.add(symbol));
+      this.ws.send(JSON.stringify(subscribeMessage));
+      this.subscribedSymbols.add(symbol);
     }
 
     console.log(`[WS] ✅ Підписано на ${eligibleSymbols.length} символів`);
@@ -555,19 +559,19 @@ class BybitWebSocketListener {
     try {
       const message = JSON.parse(data);
       
-      // Pong
-      if (message.op === 'pong') {
+      // Pong відповідь
+      if (message.channel === 'pong') {
         return;
       }
 
       // Підтвердження підписки
-      if (message.success === true) {
+      if (message.channel === 'rs.sub.deal') {
         return;
       }
 
-      // Публічні угоди
-      if (message.topic && message.topic.startsWith('publicTrade.')) {
-        const symbol = message.topic.replace('publicTrade.', '');
+      // Публічні угоди - канал push.deal
+      if (message.channel === 'push.deal' && message.data) {
+        const symbol = message.symbol;
         
         // Тільки придатні символи
         if (!this.marketDataManager.isEligible(symbol)) {
@@ -580,9 +584,14 @@ class BybitWebSocketListener {
         for (const rawTrade of trades) {
           const price = parseFloat(rawTrade.p);
           const size = parseFloat(rawTrade.v);
-          const side = rawTrade.S; // 'Buy' або 'Sell'
-          const timestamp = parseInt(rawTrade.T);
-          const valueUSD = price * size;
+          // T: 1 = Buy (taker buy), 2 = Sell (taker sell)
+          const side = rawTrade.T === 1 ? 'Buy' : 'Sell';
+          const timestamp = parseInt(rawTrade.t);
+          
+          // Отримуємо розмір контракту для розрахунку USD вартості
+          const marketData = this.marketDataManager.getMarketData(symbol);
+          const contractSize = marketData ? marketData.contractSize : 0.0001;
+          const valueUSD = price * size * contractSize;
 
           const trade = {
             price,
@@ -622,9 +631,9 @@ class BybitWebSocketListener {
   startPingInterval() {
     this.pingInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ op: 'ping' }));
+        this.ws.send(JSON.stringify({ method: 'ping' }));
       }
-    }, 20000);
+    }, 15000); // MEXC розриває з'єднання через 1 хв без ping
   }
 
   stopPingInterval() {
@@ -681,7 +690,7 @@ class AggressiveVolumeBot {
       this.marketDataManager,
       this.signalDetector
     );
-    this.wsListener = new BybitWebSocketListener(
+    this.wsListener = new MexcWebSocketListener(
       this.tradeAggregator,
       this.alertEngine,
       this.marketDataManager
@@ -691,7 +700,7 @@ class AggressiveVolumeBot {
 
   async start() {
     console.log('='.repeat(60));
-    console.log('BYBIT AGGRESSIVE VOLUME ALERT BOT');
+    console.log('MEXC AGGRESSIVE VOLUME ALERT BOT');
     console.log('Відстеження примусових рухів через агресивні угоди');
     console.log('='.repeat(60));
     console.log(`Мін об'єм для алерту: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M`);
@@ -708,7 +717,7 @@ class AggressiveVolumeBot {
     try {
       await this.telegram.sendMessage(
         CONFIG.TELEGRAM_CHAT_ID,
-        '🚀 Bybit Aggressive Volume Bot Запущено\n\n✅ Відстеження агресивних ринкових угод активне!'
+        '🚀 MEXC Aggressive Volume Bot Запущено\n\n✅ Відстеження агресивних ринкових угод активне!'
       );
       console.log('[TELEGRAM] ✅ З\'єднання успішне\n');
     } catch (error) {
@@ -748,7 +757,7 @@ class AggressiveVolumeBot {
     
     await this.telegram.sendMessage(
       CONFIG.TELEGRAM_CHAT_ID,
-      '⛔ Bybit Aggressive Volume Bot Зупинено'
+      '⛔ MEXC Aggressive Volume Bot Зупинено'
     );
     
     process.exit(0);
