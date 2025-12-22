@@ -163,12 +163,20 @@ class TradeAggregator {
   addTrade(trade) {
     const now = Date.now();
     
+    const price = parseFloat(trade.price);
+    const size = parseFloat(trade.size);
+    
+    // Validate trade data
+    if (!isFinite(price) || !isFinite(size) || price <= 0 || size <= 0) {
+      return;
+    }
+    
     this.trades.push({
       timestamp: now,
       side: trade.side,
-      price: parseFloat(trade.price),
-      size: parseFloat(trade.size),
-      usdValue: parseFloat(trade.price) * parseFloat(trade.size)
+      price: price,
+      size: size,
+      usdValue: price * size
     });
     
     // Clean old trades
@@ -188,7 +196,7 @@ class TradeAggregator {
     const now = Date.now();
     this.cleanup(now);
     
-    if (this.trades.length === 0) {
+    if (this.trades.length < 2) {
       return null;
     }
     
@@ -200,13 +208,29 @@ class TradeAggregator {
     const lastTrade = this.trades[this.trades.length - 1];
     
     for (const trade of this.trades) {
-      totalVolumeUSD += trade.usdValue;
+      const usdValue = trade.usdValue;
+      
+      // Skip invalid trades
+      if (!isFinite(usdValue) || usdValue <= 0) {
+        continue;
+      }
+      
+      totalVolumeUSD += usdValue;
       
       if (trade.side === 'Buy') {
-        buyVolumeUSD += trade.usdValue;
+        buyVolumeUSD += usdValue;
       } else {
-        sellVolumeUSD += trade.usdValue;
+        sellVolumeUSD += usdValue;
       }
+    }
+    
+    // Critical validation
+    if (totalVolumeUSD === 0 || !isFinite(totalVolumeUSD)) {
+      return null;
+    }
+    
+    if (firstTrade.price === 0 || !isFinite(firstTrade.price)) {
+      return null;
     }
     
     const dominantVolume = Math.max(buyVolumeUSD, sellVolumeUSD);
@@ -215,6 +239,11 @@ class TradeAggregator {
     
     const priceChangePercent = ((lastTrade.price - firstTrade.price) / firstTrade.price) * 100;
     const windowDurationSeconds = (lastTrade.timestamp - firstTrade.timestamp) / 1000;
+    
+    // Final validation
+    if (!isFinite(dominancePercent) || !isFinite(priceChangePercent)) {
+      return null;
+    }
     
     return {
       symbol: this.symbol,
@@ -239,6 +268,23 @@ class TradeAggregator {
 class SignalDetector {
   static shouldAlert(aggregation, symbolData) {
     if (!aggregation) return false;
+    
+    // Critical: validate all values are finite numbers
+    if (!isFinite(aggregation.totalVolumeUSD) || 
+        !isFinite(aggregation.dominancePercent) || 
+        !isFinite(aggregation.priceChangePercent)) {
+      return false;
+    }
+    
+    // Minimum trade count requirement
+    if (aggregation.tradeCount < 5) {
+      return false;
+    }
+    
+    // Minimum window duration (avoid instant spikes)
+    if (aggregation.windowDurationSeconds < 10) {
+      return false;
+    }
     
     // Check volume threshold
     if (aggregation.totalVolumeUSD < CONFIG.MIN_VOLUME_USD) {
@@ -290,13 +336,19 @@ OI: ${oiStr}`;
   }
   
   static formatVolume(value) {
-    if (value >= 1000000) {
-      return `$${(value / 1000000).toFixed(2)}M`;
+    if (!isFinite(value) || value === 0) {
+      return '$0';
     }
-    return `$${(value / 1000).toFixed(0)}K`;
+    if (value >= 1000000) {
+      return `${(value / 1000000).toFixed(2)}M`;
+    }
+    return `${(value / 1000).toFixed(0)}K`;
   }
   
   static formatDuration(seconds) {
+    if (!isFinite(seconds)) {
+      return '0m 00s';
+    }
     const minutes = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${minutes}m ${secs.toString().padStart(2, '0')}s`;
