@@ -1,20 +1,6 @@
 // ============================================================================
-// MEXC AGGRESSIVE VOLUME ALERT BOT
-// Відстежування примусових ринкових рухів через агресивний об'єм
-// ============================================================================
-// 
-// ⚠️ ЧОМУ НЕ ВИКОРИСТОВУЄМО LIQUIDATION STREAMS:
-// 1. Більшість бірж не надають публічні liquidation events в реальному часі
-// 2. Liquidation streams часто затримуються або неповні
-// 3. Насправді важливі не самі ліквідації, а ТИХ НАСЛІДОК - агресивні угоди
-// 4. Аналізуючи publicTrade ми бачимо РЕАЛЬНИЙ тиск на ринок
-// 
-// ✅ ЩО МИ РОБИМО:
-// - Слухаємо публічні угоди (push.deal)
-// - Агрегуємо об'єми купівлі/продажу в часовому вікні
-// - Визначаємо домінування однієї сторони
-// - Підтверджуємо ціновим імпульсом
-// - Інтерпретуємо це як "примусову ліквідацію"
+// BINANCE FUTURES LIQUIDATION ALERT BOT
+// Моніторинг масових ліквідацій для reversal-трейдингу з фільтрацією токенів
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -23,196 +9,84 @@ if (process.env.NODE_ENV !== 'production') {
 
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
+const { TokenFilter } = require('./token-filter');
 
 // ============================================================================
 // КОНФІГУРАЦІЯ
 // ============================================================================
 
 const CONFIG = {
-  // Пороги для алертів
-  MIN_VOLUME_USD: parseInt(process.env.MIN_VOLUME_USD) || 500_000,        // Мін об'єм для алерту
-  MIN_DOMINANCE: parseFloat(process.env.MIN_DOMINANCE) || 65.0,           // Мін домінування (%)
-  MIN_PRICE_CHANGE: parseFloat(process.env.MIN_PRICE_CHANGE) || 0.5,      // Мін зміна ціни (%)
+  // WebSocket
+  BINANCE_WS_BASE: 'wss://fstream.binance.com/stream?streams=',
   
-  // Часові вікна
-  AGGREGATION_WINDOW_SECONDS: parseInt(process.env.AGGREGATION_WINDOW_SECONDS) || 180, // 3 хвилини
+  // Пороги алертів
+  MIN_LIQUIDATION_USD: parseInt(process.env.MIN_LIQUIDATION_USD) || 1_000_000,
+  MIN_DOMINANCE: parseFloat(process.env.MIN_DOMINANCE) || 65.0,
+  
+  // Часове вікно агрегації (секунди)
+  AGGREGATION_WINDOW_SEC: parseInt(process.env.AGGREGATION_WINDOW_SEC) || 180,
+  
+  // Anti-spam
   COOLDOWN_MINUTES: parseInt(process.env.COOLDOWN_MINUTES) || 20,
+  DEDUP_WINDOW_SEC: parseInt(process.env.DEDUP_WINDOW_SEC) || 60,
   
-  // Фільтри символів
-  MIN_OPEN_INTEREST: parseInt(process.env.MIN_OPEN_INTEREST) || 10_000_000,
-  MAX_OPEN_INTEREST: parseInt(process.env.MAX_OPEN_INTEREST) || 100_000_000,
-  MIN_VOLUME_24H: parseInt(process.env.MIN_VOLUME_24H) || 5_000_000,
+  // Перевірка вікон
+  CHECK_INTERVAL_SEC: parseInt(process.env.CHECK_INTERVAL_SEC) || 15,
   
-  // Режим відлагодження (моніторить всі символи)
-  MONITOR_ALL_SYMBOLS: process.env.MONITOR_ALL_SYMBOLS === 'true',
-  
-  // Оновлення ринкових даних
-  REFRESH_MARKETS_HOURS: parseInt(process.env.REFRESH_MARKETS_HOURS) || 2,
-  
-  // API ендпоінти
-  MEXC_WS_FUTURES: 'wss://contract.mexc.com/edge',
-  MEXC_REST_API: 'https://contract.mexc.com',
+  // Фільтр токенів
+  FILTER_CONFIG: {
+    MIN_MCAP_USD: parseInt(process.env.MIN_MCAP_USD) || 10_000_000,
+    MAX_MCAP_USD: parseInt(process.env.MAX_MCAP_USD) || 150_000_000,
+    MIN_OI_USD: parseInt(process.env.MIN_OI_USD) || 7_000_000,
+    MAX_OI_USD: parseInt(process.env.MAX_OI_USD) || 35_000_000,
+    UPDATE_INTERVAL_HOURS: parseInt(process.env.FILTER_UPDATE_HOURS) || 2,
+  },
   
   // Telegram
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
+  TELEGRAM_CHAT_IDS: process.env.TELEGRAM_CHAT_ID 
+    ? process.env.TELEGRAM_CHAT_ID.split(',').map(id => id.trim())
+    : [],
 };
 
 // ============================================================================
-// МЕНЕДЖЕР РИНКОВИХ ДАНИХ
+// АГРЕГАТОР ЛІКВІДАЦІЙ
 // ============================================================================
 
-class MarketDataManager {
-  constructor() {
-    this.markets = new Map(); // symbol -> { oi, price, volume24h, contractSize, lastUpdate }
-    this.eligibleSymbols = new Set();
+class LiquidationAggregator {
+  constructor(windowSeconds) {
+    this.windows = new Map();
+    this.windowMs = windowSeconds * 1000;
   }
 
-  async fetchAllMarkets() {
-    console.log('[API] 📊 Завантаження ринкових даних з MEXC...');
-    
-    try {
-      // Отримуємо всі тікери
-      const tickersRes = await axios.get(`${CONFIG.MEXC_REST_API}/api/v1/contract/ticker`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-          'Accept': 'application/json'
-        },
-        timeout: 15000
-      });
-
-      if (!tickersRes.data.success) {
-        throw new Error(`MEXC API error: ${tickersRes.data.message || 'Unknown error'}`);
-      }
-
-      const tickers = tickersRes.data.data;
-      let eligibleCount = 0;
-      const allSymbols = [];
-
-      for (const ticker of tickers) {
-        const symbol = ticker.symbol;
-        
-        // Тільки USDT пари
-        if (!symbol.endsWith('_USDT')) continue;
-
-        const price = parseFloat(ticker.lastPrice) || 0;
-        const volume24 = parseFloat(ticker.amount24) || 0; // amount24 - це об'єм в USD
-        const holdVol = parseFloat(ticker.holdVol) || 0; // holdVol - це open interest в контрактах
-        const contractSize = parseFloat(ticker.contractSize || 0.0001); // розмір контракту
-        
-        // OI в USD = holdVol * contractSize * price
-        const oiValue = holdVol * contractSize * price;
-
-        allSymbols.push({ symbol, oiValue, volume24h: volume24, price });
-
-        this.markets.set(symbol, {
-          oi: oiValue,
-          price,
-          volume24h: volume24,
-          contractSize,
-          holdVol,
-          lastUpdate: Date.now()
-        });
-
-        // Перевірка придатності
-        const isEligible = CONFIG.MONITOR_ALL_SYMBOLS || (
-          oiValue >= CONFIG.MIN_OPEN_INTEREST &&
-          oiValue <= CONFIG.MAX_OPEN_INTEREST &&
-          volume24 >= CONFIG.MIN_VOLUME_24H
-        );
-
-        if (isEligible) {
-          this.eligibleSymbols.add(symbol);
-          eligibleCount++;
-        }
-      }
-
-      console.log(`[API] ✅ Всього ринків: ${tickers.length}`);
-      console.log(`[API] 🎯 Відібрано символів: ${eligibleCount}`);
-      
-      if (CONFIG.MONITOR_ALL_SYMBOLS) {
-        console.log(`[API] 🔥 РЕЖИМ ВІДЛАГОДЖЕННЯ: Моніторинг ВСІХ символів`);
-      } else {
-        console.log(`[API] 📋 Фільтри:`);
-        console.log(`      - OI: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-        console.log(`      - Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
-      }
-
-      if (eligibleCount === 0) {
-        console.log(`\n[API] ⚠️ Жоден символ не відповідає критеріям. Топ-10 за OI:`);
-        allSymbols
-          .sort((a, b) => b.oiValue - a.oiValue)
-          .slice(0, 10)
-          .forEach((s, i) => {
-            console.log(`      ${(i + 1).toString().padStart(2)}. ${s.symbol.padEnd(12)} | OI: $${(s.oiValue / 1e6).toFixed(1)}M`);
-          });
-      }
-      console.log('');
-
-      return Array.from(this.eligibleSymbols);
-    } catch (error) {
-      console.error('[API] ❌ Помилка завантаження:', error.message);
-      return [];
-    }
-  }
-
-  getMarketData(symbol) {
-    return this.markets.get(symbol);
-  }
-
-  isEligible(symbol) {
-    return this.eligibleSymbols.has(symbol);
-  }
-
-  getEligibleSymbols() {
-    return Array.from(this.eligibleSymbols);
-  }
-}
-
-// ============================================================================
-// АГРЕГАТОР УГОД (Trade Aggregator)
-// ============================================================================
-// Це серце системи: збирає угоди в часовому вікні та рахує домінування
-
-class TradeAggregator {
-  constructor() {
-    this.windows = new Map(); // symbol -> { trades: [], startPrice, lastPrice, startTime }
-  }
-
-  addTrade(symbol, trade) {
+  addLiquidation(symbol, liquidation) {
     if (!this.windows.has(symbol)) {
       this.windows.set(symbol, {
-        trades: [],
-        startPrice: trade.price,
-        lastPrice: trade.price,
-        startTime: trade.timestamp
+        liquidations: [],
+        startTime: Date.now()
       });
     }
 
     const window = this.windows.get(symbol);
-    window.trades.push(trade);
-    window.lastPrice = trade.price;
-
-    // Видаляємо старі угоди
+    window.liquidations.push(liquidation);
+    
     this.cleanup(symbol);
   }
 
   cleanup(symbol) {
-    const now = Date.now();
-    const windowMs = CONFIG.AGGREGATION_WINDOW_SECONDS * 1000;
-
     if (!this.windows.has(symbol)) return;
 
     const window = this.windows.get(symbol);
-    const filtered = window.trades.filter(t => now - t.timestamp < windowMs);
+    const now = Date.now();
+    
+    window.liquidations = window.liquidations.filter(
+      liq => now - liq.timestamp < this.windowMs
+    );
 
-    if (filtered.length === 0) {
+    if (window.liquidations.length === 0) {
       this.windows.delete(symbol);
     } else {
-      window.trades = filtered;
-      window.startTime = filtered[0].timestamp;
-      window.startPrice = filtered[0].price;
+      window.startTime = window.liquidations[0].timestamp;
     }
   }
 
@@ -220,51 +94,48 @@ class TradeAggregator {
     if (!this.windows.has(symbol)) return null;
 
     const window = this.windows.get(symbol);
-    if (window.trades.length === 0) return null;
+    if (window.liquidations.length === 0) return null;
 
-    let buyVolumeUSD = 0;
-    let sellVolumeUSD = 0;
+    let longVolumeUSD = 0;
+    let shortVolumeUSD = 0;
 
-    // Агрегуємо об'єми
-    for (const trade of window.trades) {
-      if (trade.side === 'Buy') {
-        buyVolumeUSD += trade.valueUSD;
+    for (const liq of window.liquidations) {
+      if (liq.side === 'LONG') {
+        longVolumeUSD += liq.volumeUSD;
       } else {
-        sellVolumeUSD += trade.valueUSD;
+        shortVolumeUSD += liq.volumeUSD;
       }
     }
 
-    const totalVolumeUSD = buyVolumeUSD + sellVolumeUSD;
+    const totalVolumeUSD = longVolumeUSD + shortVolumeUSD;
     if (totalVolumeUSD === 0) return null;
 
-    // Рахуємо домінування
-    const buyDominance = (buyVolumeUSD / totalVolumeUSD) * 100;
-    const sellDominance = (sellVolumeUSD / totalVolumeUSD) * 100;
+    const longDominance = (longVolumeUSD / totalVolumeUSD) * 100;
+    const shortDominance = (shortVolumeUSD / totalVolumeUSD) * 100;
     
-    const dominantSide = buyVolumeUSD > sellVolumeUSD ? 'buy' : 'sell';
-    const dominance = Math.max(buyDominance, sellDominance);
+    const dominantSide = longVolumeUSD > shortVolumeUSD ? 'LONG' : 'SHORT';
+    const dominance = Math.max(longDominance, shortDominance);
 
-    // Зміна ціни
-    const priceChange = ((window.lastPrice - window.startPrice) / window.startPrice) * 100;
-
-    // Тривалість
     const now = Date.now();
-    const duration = (now - window.startTime) / 1000;
+    const durationSec = (now - window.startTime) / 1000;
 
     return {
-      buyVolumeUSD,
-      sellVolumeUSD,
+      symbol,
+      longVolumeUSD,
+      shortVolumeUSD,
       totalVolumeUSD,
       dominantSide,
       dominance,
-      buyDominance,
-      sellDominance,
-      priceChange,
-      duration,
-      tradeCount: window.trades.length,
-      startPrice: window.startPrice,
-      lastPrice: window.lastPrice
+      longDominance,
+      shortDominance,
+      count: window.liquidations.length,
+      durationSec,
+      timestamp: now
     };
+  }
+
+  getAllActiveSymbols() {
+    return Array.from(this.windows.keys());
   }
 
   reset(symbol) {
@@ -275,83 +146,52 @@ class TradeAggregator {
 // ============================================================================
 // ДЕТЕКТОР СИГНАЛІВ
 // ============================================================================
-// Перевіряє чи виконані умови для алерту
 
 class SignalDetector {
   shouldAlert(stats) {
     if (!stats) return false;
 
-    // Перевірка мінімального об'єму
-    if (stats.totalVolumeUSD < CONFIG.MIN_VOLUME_USD) {
+    if (stats.totalVolumeUSD < CONFIG.MIN_LIQUIDATION_USD) {
       return false;
     }
 
-    // Перевірка домінування
     if (stats.dominance < CONFIG.MIN_DOMINANCE) {
-      return false;
-    }
-
-    // Перевірка зміни ціни (абсолютне значення)
-    if (Math.abs(stats.priceChange) < CONFIG.MIN_PRICE_CHANGE) {
-      return false;
-    }
-
-    // Додаткова перевірка: зміна ціни має відповідати напрямку домінування
-    // Якщо купівля домінує, ціна має рости (і навпаки)
-    if (stats.dominantSide === 'buy' && stats.priceChange < 0) {
-      return false;
-    }
-    if (stats.dominantSide === 'sell' && stats.priceChange > 0) {
       return false;
     }
 
     return true;
   }
 
-  interpretSignal(stats) {
-    // BUY домінує = шорти ліквідуються (примусова купівля)
-    // SELL домінує = лонги ліквідуються (примусовий продаж)
-    
-    if (stats.dominantSide === 'buy') {
-      return {
-        type: 'ШОРТІВ',
-        emoji: '🔥',
-        direction: 'купівля'
-      };
-    } else {
-      return {
-        type: 'ЛОНГІВ',
-        emoji: '🌊',
-        direction: 'продаж'
-      };
-    }
+  getSignature(stats) {
+    return `${stats.symbol}:${stats.dominantSide}:${Math.floor(stats.totalVolumeUSD / 100000)}`;
   }
 }
 
 // ============================================================================
-// МЕНЕДЖЕР COOLDOWN
+// COOLDOWN МЕНЕДЖЕР
 // ============================================================================
 
 class CooldownManager {
-  constructor(cooldownMinutes) {
+  constructor(cooldownMinutes, dedupWindowSec) {
     this.cooldowns = new Map();
+    this.recentAlerts = new Map();
     this.cooldownMs = cooldownMinutes * 60 * 1000;
+    this.dedupWindowMs = dedupWindowSec * 1000;
   }
 
-  canAlert(symbol, stats) {
-    if (!this.cooldowns.has(symbol)) {
-      return true;
+  canAlert(symbol, stats, signature) {
+    const now = Date.now();
+
+    if (this.cooldowns.has(symbol)) {
+      const lastAlert = this.cooldowns.get(symbol);
+      if (now - lastAlert < this.cooldownMs) {
+        return false;
+      }
     }
 
-    const lastAlert = this.cooldowns.get(symbol);
-    const now = Date.now();
-    
-    if (now - lastAlert.timestamp < this.cooldownMs) {
-      // Дозволяємо новий алерт якщо об'єм значно більший або інша сторона
-      const volumeIncrease = stats.totalVolumeUSD / lastAlert.volume;
-      const sameSide = stats.dominantSide === lastAlert.side;
-      
-      if (sameSide && volumeIncrease < 1.5) {
+    if (this.recentAlerts.has(signature)) {
+      const lastSig = this.recentAlerts.get(signature);
+      if (now - lastSig < this.dedupWindowMs) {
         return false;
       }
     }
@@ -359,12 +199,28 @@ class CooldownManager {
     return true;
   }
 
-  recordAlert(symbol, stats) {
-    this.cooldowns.set(symbol, {
-      timestamp: Date.now(),
-      volume: stats.totalVolumeUSD,
-      side: stats.dominantSide
-    });
+  recordAlert(symbol, signature) {
+    const now = Date.now();
+    this.cooldowns.set(symbol, now);
+    this.recentAlerts.set(signature, now);
+    
+    this.cleanup();
+  }
+
+  cleanup() {
+    const now = Date.now();
+    
+    for (const [symbol, timestamp] of this.cooldowns.entries()) {
+      if (now - timestamp > this.cooldownMs * 2) {
+        this.cooldowns.delete(symbol);
+      }
+    }
+
+    for (const [sig, timestamp] of this.recentAlerts.entries()) {
+      if (now - timestamp > this.dedupWindowMs * 2) {
+        this.recentAlerts.delete(sig);
+      }
+    }
   }
 }
 
@@ -373,125 +229,129 @@ class CooldownManager {
 // ============================================================================
 
 class AlertFormatter {
-  format(symbol, stats, interpretation, marketData) {
+  format(stats) {
     const lines = [];
     
-    lines.push(`${interpretation.emoji} ЛІКВІДАЦІЯ ${interpretation.type}`);
-    lines.push(`Об'єм: $${this.formatNumber(stats.totalVolumeUSD)} (${this.formatDuration(stats.duration)})`);
-    lines.push(`Домінування: ${stats.dominance.toFixed(1)}% ${interpretation.direction.toUpperCase()}`);
-    lines.push('—————————————————');
+    const emoji = stats.dominantSide === 'LONG' ? '🌊' : '🔥';
+    const sideText = stats.dominantSide === 'LONG' ? 'ЛОНГОВ' : 'ШОРТОВ';
+    lines.push(`${emoji} ЛИКВИДАЦИЯ ${sideText}`);
     
-    const cleanSymbol = symbol.replace('_USDT', '');
-    lines.push(`🔥 ${symbol} #${cleanSymbol}`);
+    const volumeStr = this.formatVolume(stats.totalVolumeUSD);
+    const durationStr = this.formatDuration(stats.durationSec);
+    lines.push(`Объем: $${volumeStr} (за ${durationStr})`);
     
-    const priceChangeSign = stats.priceChange >= 0 ? '+' : '';
-    lines.push(`⏱ Зміна ціни: ${priceChangeSign}${stats.priceChange.toFixed(2)}%`);
+    const dominanceText = stats.dominantSide === 'LONG' ? 'ЛОНГОВ' : 'ШОРТОВ';
+    lines.push(`Доминирование: ${stats.dominance.toFixed(1)}% ${dominanceText}`);
     
-    lines.push('💥 Агресивний об\'єм:');
-    lines.push(`🟢 Купівля: $${this.formatNumber(stats.buyVolumeUSD)}`);
-    lines.push(`🔴 Продаж: $${this.formatNumber(stats.sellVolumeUSD)}`);
+    lines.push('————————————————————');
     
-    if (marketData) {
-      lines.push('—————————————————');
-      lines.push(`💸 OI: $${this.formatNumber(marketData.oi)}`);
-      lines.push(`📊 Поточна ціна: $${marketData.price.toFixed(4)}`);
-    }
+    const cleanSymbol = stats.symbol.replace('USDT', '');
+    lines.push(`🔥 ${stats.symbol} #${cleanSymbol}`);
+    
+    const windowMin = Math.floor(stats.durationSec / 60);
+    lines.push(`⏱️ Окно: ${windowMin} мин`);
+    
+    lines.push(`📊 Кол-во ликвидаций: ${stats.count}`);
     
     return lines.join('\n');
   }
 
-  formatNumber(num) {
-    if (num >= 1_000_000) {
-      return (num / 1_000_000).toFixed(2) + 'M';
+  formatVolume(usd) {
+    if (usd >= 1_000_000) {
+      return `${(usd / 1_000_000).toFixed(2)}M`;
     }
-    if (num >= 1_000) {
-      return (num / 1_000).toFixed(0) + 'K';
-    }
-    return num.toFixed(0);
+    return `${(usd / 1_000).toFixed(0)}K`;
   }
 
   formatDuration(seconds) {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
-    return `${mins}хв ${secs}с`;
+    return `${mins}м ${secs}с`;
   }
 }
 
 // ============================================================================
-// ДВИЖОК АЛЕРТІВ
+// TELEGRAM NOTIFIER
 // ============================================================================
 
-class AlertEngine {
-  constructor(telegram, cooldownManager, marketDataManager, signalDetector) {
-    this.telegram = telegram;
-    this.cooldownManager = cooldownManager;
-    this.marketDataManager = marketDataManager;
-    this.signalDetector = signalDetector;
+class TelegramNotifier {
+  constructor(token, chatIds) {
+    this.bot = new TelegramBot(token, { polling: false });
+    this.chatIds = chatIds;
     this.formatter = new AlertFormatter();
   }
 
-  async checkAndAlert(symbol, stats, tradeAggregator) {
-    // Перевіряємо умови
-    if (!this.signalDetector.shouldAlert(stats)) {
-      return;
-    }
-
-    // Перевіряємо cooldown
-    if (!this.cooldownManager.canAlert(symbol, stats)) {
-      return;
-    }
-
-    // Отримуємо інтерпретацію
-    const interpretation = this.signalDetector.interpretSignal(stats);
-
-    // Отримуємо ринкові дані
-    const marketData = this.marketDataManager.getMarketData(symbol);
-
-    // Форматуємо та відправляємо
-    const message = this.formatter.format(symbol, stats, interpretation, marketData);
+  async sendAlert(stats) {
+    const message = this.formatter.format(stats);
     
-    try {
-      await this.telegram.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message);
-      this.cooldownManager.recordAlert(symbol, stats);
-      
-      console.log(`[🚨 АЛЕРТ] ${symbol} - ${interpretation.type} - $${(stats.totalVolumeUSD / 1e6).toFixed(2)}M - ${stats.dominance.toFixed(1)}% - Δ${stats.priceChange.toFixed(2)}%`);
-      
-      // Скидаємо вікно після алерту
-      tradeAggregator.reset(symbol);
-    } catch (error) {
-      console.error(`[ERROR] Помилка відправки алерту для ${symbol}:`, error.message);
-    }
+    const promises = this.chatIds.map(chatId =>
+      this.bot.sendMessage(chatId, message).catch(err => {
+        console.error(`[TELEGRAM] Помилка відправки до ${chatId}:`, err.message);
+      })
+    );
+
+    await Promise.all(promises);
+  }
+
+  async sendStatus(message) {
+    const promises = this.chatIds.map(chatId =>
+      this.bot.sendMessage(chatId, message).catch(err => {
+        console.error(`[TELEGRAM] Помилка відправки статусу:`, err.message);
+      })
+    );
+
+    await Promise.all(promises);
   }
 }
 
 // ============================================================================
-// MEXC WEBSOCKET (PUSH.DEAL)
+// WEBSOCKET МЕНЕДЖЕР (з підтримкою фільтра токенів)
 // ============================================================================
-// Слухаємо публічні угоди через push.deal канал
 
-class MexcWebSocketListener {
-  constructor(tradeAggregator, alertEngine, marketDataManager) {
-    this.tradeAggregator = tradeAggregator;
-    this.alertEngine = alertEngine;
-    this.marketDataManager = marketDataManager;
+class BinanceWebSocketManager {
+  constructor(aggregator, tokenFilter) {
+    this.aggregator = aggregator;
+    this.tokenFilter = tokenFilter;
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 5000;
-    this.pingInterval = null;
-    this.subscribedSymbols = new Set();
+    this.isConnected = false;
+    this.currentSubscription = new Set();
   }
 
   async connect() {
-    console.log('[WS] 🔌 Підключення до MEXC WebSocket...');
+    // Чекаємо ініціалізації фільтра
+    if (!this.tokenFilter.isInitialized) {
+      console.log('[WS] Очікування ініціалізації фільтра...');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+    console.log('[WS] Підключення до Binance Futures...');
     
-    this.ws = new WebSocket(CONFIG.MEXC_WS_FUTURES);
+    // Отримуємо валідні токени
+    const validTokens = this.tokenFilter.getValidTokens();
+    
+    if (validTokens.length === 0) {
+      console.error('[WS] Немає валідних токенів для підписки!');
+      return;
+    }
+
+    // Формуємо список стрімів
+    const streams = validTokens.map(symbol => 
+      `${symbol.toLowerCase()}@forceOrder`
+    );
+
+    // Підключаємося
+    const wsUrl = CONFIG.BINANCE_WS_BASE + streams.join('/');
+    this.ws = new WebSocket(wsUrl);
 
     this.ws.on('open', () => {
-      console.log('[WS] ✅ Підключено успішно');
+      console.log('[WS] ✅ Підключено');
+      console.log(`[WS] Підписано на ${validTokens.length} токенів`);
+      this.isConnected = true;
       this.reconnectAttempts = 0;
-      this.startPingInterval();
-      this.subscribeToTrades();
+      this.currentSubscription = new Set(validTokens);
     });
 
     this.ws.on('message', (data) => {
@@ -504,143 +364,57 @@ class MexcWebSocketListener {
 
     this.ws.on('close', () => {
       console.log('[WS] З\'єднання закрито');
-      this.stopPingInterval();
+      this.isConnected = false;
       this.reconnect();
     });
-  }
-
-  subscribeToTrades() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const eligibleSymbols = this.marketDataManager.getEligibleSymbols();
-    
-    if (eligibleSymbols.length === 0) {
-      console.log('[WS] ⚠️ Немає придатних символів для підписки');
-      return;
-    }
-
-    console.log(`[WS] 📡 Підписка на ${eligibleSymbols.length} символів (push.deal)...`);
-
-    // Підписуємося на кожен символ окремо
-    for (const symbol of eligibleSymbols) {
-      const subscribeMessage = {
-        method: 'sub.deal',
-        param: {
-          symbol: symbol
-        }
-      };
-      
-      this.ws.send(JSON.stringify(subscribeMessage));
-      this.subscribedSymbols.add(symbol);
-    }
-
-    console.log(`[WS] ✅ Підписано на ${eligibleSymbols.length} символів`);
-    console.log('[WS] 📊 Перші 15 символів:');
-    
-    eligibleSymbols.slice(0, 15).forEach(symbol => {
-      const data = this.marketDataManager.getMarketData(symbol);
-      if (data) {
-        console.log(`     ${symbol.padEnd(15)} | OI: $${(data.oi / 1e6).toFixed(1)}M`);
-      }
-    });
-    
-    if (eligibleSymbols.length > 15) {
-      console.log(`     ... та ще ${eligibleSymbols.length - 15}`);
-    }
-    
-    console.log('\n[STATUS] 🎯 Моніторинг агресивних угод...');
-    console.log(`[STATUS] 💰 Поріг: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M обсяг, ${CONFIG.MIN_DOMINANCE}% домінування, ${CONFIG.MIN_PRICE_CHANGE}% зміна ціни`);
-    console.log('[STATUS] ⏳ Очікування угод...\n');
   }
 
   handleMessage(data) {
     try {
       const message = JSON.parse(data);
       
-      // Pong відповідь
-      if (message.channel === 'pong') {
-        return;
-      }
+      // Формат: { stream: "btcusdt@forceOrder", data: { o: {...} } }
+      if (!message.data || !message.data.o) return;
 
-      // Підтвердження підписки
-      if (message.channel === 'rs.sub.deal') {
-        return;
-      }
+      const order = message.data.o;
+      const symbol = order.s;
 
-      // Публічні угоди - канал push.deal
-      if (message.channel === 'push.deal' && message.data) {
-        const symbol = message.symbol;
-        
-        // Тільки придатні символи
-        if (!this.marketDataManager.isEligible(symbol)) {
-          return;
-        }
-
-        // Обробляємо кожну угоду в масиві data
-        const trades = Array.isArray(message.data) ? message.data : [message.data];
-        
-        for (const rawTrade of trades) {
-          const price = parseFloat(rawTrade.p);
-          const size = parseFloat(rawTrade.v);
-          // T: 1 = Buy (taker buy), 2 = Sell (taker sell)
-          const side = rawTrade.T === 1 ? 'Buy' : 'Sell';
-          const timestamp = parseInt(rawTrade.t);
-          
-          // Отримуємо розмір контракту для розрахунку USD вартості
-          const marketData = this.marketDataManager.getMarketData(symbol);
-          const contractSize = marketData ? marketData.contractSize : 0.0001;
-          const valueUSD = price * size * contractSize;
-
-          const trade = {
-            price,
-            size,
-            side,
-            timestamp,
-            valueUSD
-          };
-
-          // Додаємо угоду в агрегатор
-          this.tradeAggregator.addTrade(symbol, trade);
-
-          // Логуємо тільки великі угоди
-          if (valueUSD >= 50000) {
-            const sideEmoji = side === 'Buy' ? '🟢' : '🔴';
-            console.log(`[TRADE] ${symbol.padEnd(12)} | ${sideEmoji} ${side.padEnd(4)} | $${(valueUSD / 1000).toFixed(1)}K @ $${price.toFixed(2)}`);
-          }
-
-          // Перевіряємо статистику вікна
-          const stats = this.tradeAggregator.getWindowStats(symbol);
-          if (stats && stats.totalVolumeUSD >= CONFIG.MIN_VOLUME_USD * 0.5) {
-            // Логуємо прогрес
-            const domType = stats.dominantSide === 'buy' ? '🟢 BUY' : '🔴 SELL';
-            console.log(`[WINDOW] ${symbol.padEnd(12)} | Всього: $${(stats.totalVolumeUSD / 1000).toFixed(1)}K | ${domType} ${stats.dominance.toFixed(1)}% | Ціна: ${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(2)}% | ${stats.duration.toFixed(0)}с`);
-            
-            // Перевіряємо чи готові до алерту
-            this.alertEngine.checkAndAlert(symbol, stats, this.tradeAggregator);
-          }
-        }
+      // КРИТИЧНО: Перевірка фільтра
+      if (!this.tokenFilter.isValid(symbol)) {
+        return; // Ігноруємо токени поза фільтром
       }
       
+      const side = order.S === 'BUY' ? 'SHORT' : 'LONG';
+      const price = parseFloat(order.p);
+      const quantity = parseFloat(order.q);
+      const volumeUSD = price * quantity;
+
+      this.aggregator.addLiquidation(symbol, {
+        side,
+        price,
+        quantity,
+        volumeUSD,
+        timestamp: Date.now()
+      });
+
     } catch (error) {
-      console.error('[ERROR] Помилка обробки повідомлення:', error.message);
+      // Мовчки ігноруємо помилки парсингу
     }
   }
 
-  startPingInterval() {
-    this.pingInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ method: 'ping' }));
-      }
-    }, 15000); // MEXC розриває з'єднання через 1 хв без ping
-  }
-
-  stopPingInterval() {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
+  async resubscribe() {
+    console.log('[WS] Переподписка на нові токени...');
+    
+    // Закриваємо старе з'єднання
+    if (this.ws) {
+      this.ws.close();
     }
+
+    // Чекаємо трохи перед новим підключенням
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Підключаємось знову
+    await this.connect();
   }
 
   reconnect() {
@@ -650,23 +424,14 @@ class MexcWebSocketListener {
     }
 
     this.reconnectAttempts++;
-    console.log(`[WS] Переподключення через ${this.reconnectDelay / 1000}с... (спроба ${this.reconnectAttempts})`);
+    console.log(`[WS] Переподключення через ${this.reconnectDelay / 1000}с (спроба ${this.reconnectAttempts})`);
     
     setTimeout(() => {
       this.connect();
     }, this.reconnectDelay);
   }
 
-  async resubscribe() {
-    console.log('[WS] Оновлення підписок...');
-    this.subscribedSymbols.clear();
-    
-    await this.marketDataManager.fetchAllMarkets();
-    this.subscribeToTrades();
-  }
-
   close() {
-    this.stopPingInterval();
     if (this.ws) {
       this.ws.close();
     }
@@ -674,106 +439,197 @@ class MexcWebSocketListener {
 }
 
 // ============================================================================
-// ГОЛОВНИЙ ДОДАТОК
+// ALERT ENGINE
 // ============================================================================
 
-class AggressiveVolumeBot {
+class AlertEngine {
+  constructor(aggregator, detector, cooldownManager, notifier, tokenFilter) {
+    this.aggregator = aggregator;
+    this.detector = detector;
+    this.cooldownManager = cooldownManager;
+    this.notifier = notifier;
+    this.tokenFilter = tokenFilter;
+    this.checkInterval = null;
+  }
+
+  start() {
+    console.log(`[ENGINE] Запуск перевірки кожні ${CONFIG.CHECK_INTERVAL_SEC}с`);
+    
+    this.checkInterval = setInterval(() => {
+      this.checkAllWindows();
+    }, CONFIG.CHECK_INTERVAL_SEC * 1000);
+  }
+
+  checkAllWindows() {
+    const symbols = this.aggregator.getAllActiveSymbols();
+    
+    for (const symbol of symbols) {
+      // КРИТИЧНО: Перевірка фільтра
+      if (!this.tokenFilter.isValid(symbol)) {
+        continue;
+      }
+
+      const stats = this.aggregator.getWindowStats(symbol);
+      
+      if (!stats) continue;
+
+      if (!this.detector.shouldAlert(stats)) {
+        continue;
+      }
+
+      const signature = this.detector.getSignature(stats);
+      if (!this.cooldownManager.canAlert(symbol, stats, signature)) {
+        continue;
+      }
+
+      this.sendAlert(symbol, stats, signature);
+    }
+  }
+
+  async sendAlert(symbol, stats, signature) {
+    try {
+      await this.notifier.sendAlert(stats);
+      
+      this.cooldownManager.recordAlert(symbol, signature);
+      
+      console.log(`[🚨 ALERT] ${symbol} | ${stats.dominantSide} | $${(stats.totalVolumeUSD / 1e6).toFixed(2)}M | ${stats.dominance.toFixed(1)}%`);
+      
+      this.aggregator.reset(symbol);
+      
+    } catch (error) {
+      console.error(`[ERROR] Помилка відправки алерту ${symbol}:`, error.message);
+    }
+  }
+
+  stop() {
+    if (this.checkInterval) {
+      clearInterval(this.checkInterval);
+    }
+  }
+}
+
+// ============================================================================
+// ГОЛОВНИЙ БОТ
+// ============================================================================
+
+class BinanceLiquidationBot {
   constructor() {
-    this.telegram = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
-    this.marketDataManager = new MarketDataManager();
-    this.tradeAggregator = new TradeAggregator();
-    this.signalDetector = new SignalDetector();
-    this.cooldownManager = new CooldownManager(CONFIG.COOLDOWN_MINUTES);
+    this.tokenFilter = new TokenFilter(CONFIG.FILTER_CONFIG);
+    this.aggregator = new LiquidationAggregator(CONFIG.AGGREGATION_WINDOW_SEC);
+    this.detector = new SignalDetector();
+    this.cooldownManager = new CooldownManager(
+      CONFIG.COOLDOWN_MINUTES,
+      CONFIG.DEDUP_WINDOW_SEC
+    );
+    this.notifier = new TelegramNotifier(
+      CONFIG.TELEGRAM_TOKEN,
+      CONFIG.TELEGRAM_CHAT_IDS
+    );
+    this.wsManager = new BinanceWebSocketManager(this.aggregator, this.tokenFilter);
     this.alertEngine = new AlertEngine(
-      this.telegram,
+      this.aggregator,
+      this.detector,
       this.cooldownManager,
-      this.marketDataManager,
-      this.signalDetector
+      this.notifier,
+      this.tokenFilter
     );
-    this.wsListener = new MexcWebSocketListener(
-      this.tradeAggregator,
-      this.alertEngine,
-      this.marketDataManager
-    );
-    this.refreshInterval = null;
+
+    // Слухаємо оновлення фільтра
+    this.setupFilterListener();
+  }
+
+  setupFilterListener() {
+    // Перевіряємо оновлення фільтра кожні 2 години + 1 хвилину
+    const checkInterval = CONFIG.FILTER_CONFIG.UPDATE_INTERVAL_HOURS * 60 * 60 * 1000 + 60000;
+    
+    setInterval(async () => {
+      console.log('[BOT] Перевірка необхідності переподписки...');
+      await this.wsManager.resubscribe();
+    }, checkInterval);
   }
 
   async start() {
-    console.log('='.repeat(60));
-    console.log('MEXC AGGRESSIVE VOLUME ALERT BOT');
-    console.log('Відстеження примусових рухів через агресивні угоди');
-    console.log('='.repeat(60));
-    console.log(`Мін об'єм для алерту: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M`);
+    console.log('='.repeat(70));
+    console.log('BINANCE FUTURES LIQUIDATION ALERT BOT');
+    console.log('='.repeat(70));
+    console.log(`Мін об'єм: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
     console.log(`Мін домінування: ${CONFIG.MIN_DOMINANCE}%`);
-    console.log(`Мін зміна ціни: ${CONFIG.MIN_PRICE_CHANGE}%`);
-    console.log(`Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SECONDS}с`);
-    console.log(`OI діапазон: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-    console.log(`Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
-    console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хвилин`);
-    console.log(`Оновлення ринків: кожні ${CONFIG.REFRESH_MARKETS_HOURS} години`);
-    console.log('='.repeat(60));
+    console.log(`Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SEC}с`);
+    console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хв`);
+    console.log(`Dedup вікно: ${CONFIG.DEDUP_WINDOW_SEC}с`);
+    console.log('='.repeat(70));
+    console.log('ФІЛЬТР ТОКЕНІВ:');
+    console.log(`  MCAP: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_MCAP_USD)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_MCAP_USD)}`);
+    console.log(`  OI: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_OI_USD)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_OI_USD)}`);
+    console.log(`  Оновлення: кожні ${CONFIG.FILTER_CONFIG.UPDATE_INTERVAL_HOURS}год`);
+    console.log('='.repeat(70));
+
+    // Ініціалізація фільтра токенів
+    await this.tokenFilter.initialize();
+
+    const stats = this.tokenFilter.getStats();
+    console.log('\n[FILTER] Статистика:');
+    console.log(`  • Всього валідних токенів: ${stats.total}`);
+    console.log(`  • Валідні по OI: ${stats.validByOI}`);
+    console.log(`  • Валідні по MCAP: ${stats.validByMCAP}`);
+    console.log(`  • Валідні по обом: ${stats.validByBoth}\n`);
 
     // Тест Telegram
     try {
-      await this.telegram.sendMessage(
-        CONFIG.TELEGRAM_CHAT_ID,
-        '🚀 MEXC Aggressive Volume Bot Запущено\n\n✅ Відстеження агресивних ринкових угод активне!'
+      await this.notifier.sendStatus(
+        '🚀 Binance Liquidation Bot запущено\n\n' +
+        `✅ Мін об\'єм: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M\n` +
+        `✅ Мін домінування: ${CONFIG.MIN_DOMINANCE}%\n` +
+        `✅ Вікно: ${CONFIG.AGGREGATION_WINDOW_SEC}с\n` +
+        `✅ Валідних токенів: ${stats.total}`
       );
-      console.log('[TELEGRAM] ✅ З\'єднання успішне\n');
+      console.log('[TELEGRAM] ✅ Підключено\n');
     } catch (error) {
-      console.error('[TELEGRAM] ❌ Помилка підключення:', error.message);
+      console.error('[TELEGRAM] ❌ Помилка:', error.message);
       process.exit(1);
     }
 
-    // Завантажуємо ринкові дані
-    await this.marketDataManager.fetchAllMarkets();
+    // Запуск WebSocket
+    await this.wsManager.connect();
 
-    // Підключаємо WebSocket
-    await this.wsListener.connect();
-
-    // Запускаємо періодичне оновлення
-    this.startMarketRefresh();
+    // Запуск движка алертів
+    this.alertEngine.start();
 
     // Обробники завершення
     process.on('SIGINT', () => this.shutdown());
     process.on('SIGTERM', () => this.shutdown());
   }
 
-  startMarketRefresh() {
-    this.refreshInterval = setInterval(async () => {
-      console.log('\n[REFRESH] 🔄 Оновлення ринкових даних...');
-      await this.wsListener.resubscribe();
-    }, CONFIG.REFRESH_MARKETS_HOURS * 60 * 60 * 1000);
+  formatNum(num) {
+    if (num >= 1_000_000) {
+      return `${(num / 1_000_000).toFixed(1)}M`;
+    }
+    return `${(num / 1_000).toFixed(0)}K`;
   }
 
   async shutdown() {
     console.log('\n[SHUTDOWN] Зупинка бота...');
     
-    if (this.refreshInterval) {
-      clearInterval(this.refreshInterval);
-    }
+    this.alertEngine.stop();
+    this.tokenFilter.stop();
+    this.wsManager.close();
     
-    this.wsListener.close();
-    
-    await this.telegram.sendMessage(
-      CONFIG.TELEGRAM_CHAT_ID,
-      '⛔ MEXC Aggressive Volume Bot Зупинено'
-    );
+    await this.notifier.sendStatus('⛔ Binance Liquidation Bot зупинено');
     
     process.exit(0);
   }
 }
 
 // ============================================================================
-// ЗАПУСК БОТА
+// ЗАПУСК
 // ============================================================================
 
 if (require.main === module) {
-  const bot = new AggressiveVolumeBot();
+  const bot = new BinanceLiquidationBot();
   bot.start().catch(error => {
-    console.error('[FATAL ERROR]', error);
+    console.error('[FATAL]', error);
     process.exit(1);
   });
 }
 
-module.exports = { AggressiveVolumeBot };
+module.exports = { BinanceLiquidationBot };
