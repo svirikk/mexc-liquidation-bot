@@ -47,9 +47,6 @@ const CONFIG = {
   AGGREGATION_WINDOW_SECONDS: parseInt(process.env.AGGREGATION_WINDOW_SECONDS) || 180, // 3 хвилини
   COOLDOWN_MINUTES: parseInt(process.env.COOLDOWN_MINUTES) || 20,
   
-  // Обмеження частоти алертів
-  MAX_ALERTS_PER_MINUTE: parseInt(process.env.MAX_ALERTS_PER_MINUTE) || 5, // Максимум алертів за хвилину
-  
   // Фільтри символів
   MIN_OPEN_INTEREST: parseInt(process.env.MIN_OPEN_INTEREST) || 10_000_000,
   MAX_OPEN_INTEREST: parseInt(process.env.MAX_OPEN_INTEREST) || 100_000_000,
@@ -183,9 +180,7 @@ class MarketDataManager {
 
 class TradeAggregator {
   constructor() {
-    this.windows = new Map(); // symbol -> { trades: [], startPrice, lastPrice, startTime }
-    this.alertedSymbols = new Set(); // 🔥 ОКРЕМИЙ SET для відстежування алертів
-    this.lastAlertTime = new Map(); // symbol -> timestamp останнього алерту
+    this.windows = new Map(); // symbol -> { trades: [], startPrice, lastPrice, startTime, alerted }
   }
 
   addTrade(symbol, trade) {
@@ -194,7 +189,8 @@ class TradeAggregator {
         trades: [],
         startPrice: trade.price,
         lastPrice: trade.price,
-        startTime: trade.timestamp
+        startTime: trade.timestamp,
+        alerted: false  // 🔥 НОВИЙ ФЛАГ - чи вже відправили алерт
       });
     }
 
@@ -207,13 +203,15 @@ class TradeAggregator {
   }
 
   hasAlerted(symbol) {
-    return this.alertedSymbols.has(symbol);
+    const window = this.windows.get(symbol);
+    return window ? window.alerted : false;
   }
 
   markAsAlerted(symbol) {
-    this.alertedSymbols.add(symbol);
-    this.lastAlertTime.set(symbol, Date.now());
-    console.log(`[LOCK] ${symbol} - заблоковано від дублікатів на 30 секунд`);
+    const window = this.windows.get(symbol);
+    if (window) {
+      window.alerted = true;
+    }
   }
 
   cleanup(symbol) {
@@ -226,24 +224,11 @@ class TradeAggregator {
     const filtered = window.trades.filter(t => now - t.timestamp < windowMs);
 
     if (filtered.length === 0) {
-      // Якщо вікно порожнє - видаляємо все
       this.windows.delete(symbol);
-      // Але НЕ видаляємо з alertedSymbols! Це зробить окремий таймер
     } else {
-      // Оновлюємо вікно
       window.trades = filtered;
       window.startTime = filtered[0].timestamp;
       window.startPrice = filtered[0].price;
-    }
-
-    // Очищаємо старі блокування (через 30 секунд після алерту)
-    if (this.alertedSymbols.has(symbol)) {
-      const lastAlert = this.lastAlertTime.get(symbol);
-      if (lastAlert && (now - lastAlert > 30000)) {
-        this.alertedSymbols.delete(symbol);
-        this.lastAlertTime.delete(symbol);
-        console.log(`[UNLOCK] ${symbol} - розблоковано, готовий до нових алертів`);
-      }
     }
   }
 
@@ -300,7 +285,18 @@ class TradeAggregator {
 
   reset(symbol) {
     this.windows.delete(symbol);
-    // alertedSymbols очищається автоматично через 30 секунд у cleanup()
+  }
+
+  hasAlerted(symbol) {
+    const window = this.windows.get(symbol);
+    return window ? window.alerted : false;
+  }
+
+  markAsAlerted(symbol) {
+    const window = this.windows.get(symbol);
+    if (window) {
+      window.alerted = true;
+    }
   }
 }
 
@@ -460,27 +456,6 @@ class AlertEngine {
     this.marketDataManager = marketDataManager;
     this.signalDetector = signalDetector;
     this.formatter = new AlertFormatter();
-    this.recentAlerts = []; // Для обмеження кількості алертів
-  }
-
-  canSendAlert() {
-    const now = Date.now();
-    const oneMinuteAgo = now - 60000;
-    
-    // Очищаємо старі записи
-    this.recentAlerts = this.recentAlerts.filter(t => t > oneMinuteAgo);
-    
-    // Перевіряємо ліміт
-    if (this.recentAlerts.length >= CONFIG.MAX_ALERTS_PER_MINUTE) {
-      console.log(`[ЛІМІТ] Досягнуто максимум ${CONFIG.MAX_ALERTS_PER_MINUTE} алертів за хвилину. Чекаємо...`);
-      return false;
-    }
-    
-    return true;
-  }
-
-  recordAlertSent() {
-    this.recentAlerts.push(Date.now());
   }
 
   async checkAndAlert(symbol, stats, tradeAggregator) {
@@ -547,7 +522,6 @@ class BybitWebSocketListener {
     this.reconnectDelay = 5000;
     this.pingInterval = null;
     this.subscribedSymbols = new Set();
-    this.lastLogTime = new Map(); // Для дебаунсу логів
   }
 
   async connect() {
@@ -772,9 +746,8 @@ class AggressiveVolumeBot {
     console.log(`Мін зміна ціни: ${CONFIG.MIN_PRICE_CHANGE}%`);
     console.log(`Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SECONDS}с`);
     console.log(`OI діапазон: $${(CONFIG.MIN_OPEN_INTEREST / 1e6).toFixed(1)}M - $${(CONFIG.MAX_OPEN_INTEREST / 1e6).toFixed(1)}M`);
-    console.log(`Min 24h обсяг: ${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
+    console.log(`Мін 24h обсяг: $${(CONFIG.MIN_VOLUME_24H / 1e6).toFixed(1)}M`);
     console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хвилин`);
-    console.log(`Макс алертів за хвилину: ${CONFIG.MAX_ALERTS_PER_MINUTE}`);
     console.log(`Оновлення ринків: кожні ${CONFIG.REFRESH_MARKETS_HOURS} години`);
     console.log('='.repeat(60));
     console.log('📌 ВАЖЛИВО: Час у сповіщеннях (~2-5 хвилин) - це НОРМАЛЬНО!');
