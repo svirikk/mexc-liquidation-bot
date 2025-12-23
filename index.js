@@ -1,7 +1,12 @@
 // ============================================================================
 // BINANCE FUTURES LIQUIDATION ALERT BOT
 // Моніторинг масових ліквідацій для reversal-трейдингу
-// Підписка на ВСІ токени Binance Futures, фільтрація по MCAP
+// 
+// ЛОГІКА:
+// 1. Отримати ВСІ токени з Binance Futures
+// 2. Перевірити MCAP кожного на CoinGecko
+// 3. Підписатись ТІЛЬКИ на валідні (в діапазоні MCAP)
+// 4. Оновлювати список кожні 2 години
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -17,8 +22,8 @@ const { TokenFilter } = require('./token-filter');
 // ============================================================================
 
 const CONFIG = {
-  // WebSocket - глобальний стрім всіх ліквідацій
-  BINANCE_WS: 'wss://fstream.binance.com/ws/!forceOrder@arr',
+  // WebSocket - множинні стріми для валідних токенів
+  BINANCE_WS_BASE: 'wss://fstream.binance.com/stream?streams=',
   
   // Пороги алертів
   MIN_LIQUIDATION_USD: parseInt(process.env.MIN_LIQUIDATION_USD) || 1_000_000,
@@ -53,23 +58,12 @@ const CONFIG = {
 // ============================================================================
 
 class LiquidationAggregator {
-  constructor(windowSeconds, tokenFilter) {
+  constructor(windowSeconds) {
     this.windows = new Map();
     this.windowMs = windowSeconds * 1000;
-    this.tokenFilter = tokenFilter;
-    this.totalProcessed = 0;
-    this.totalFiltered = 0;
   }
 
   addLiquidation(symbol, liquidation) {
-    this.totalProcessed++;
-    
-    // КРИТИЧНО: Перевірка фільтра ПЕРЕД додаванням
-    if (!this.tokenFilter.isValid(symbol)) {
-      this.totalFiltered++;
-      return false;
-    }
-
     if (!this.windows.has(symbol)) {
       this.windows.set(symbol, {
         liquidations: [],
@@ -81,7 +75,6 @@ class LiquidationAggregator {
     window.liquidations.push(liquidation);
     
     this.cleanup(symbol);
-    return true;
   }
 
   cleanup(symbol) {
@@ -151,16 +144,6 @@ class LiquidationAggregator {
 
   reset(symbol) {
     this.windows.delete(symbol);
-  }
-
-  getStats() {
-    return {
-      totalProcessed: this.totalProcessed,
-      totalFiltered: this.totalFiltered,
-      filterRate: this.totalProcessed > 0 
-        ? ((this.totalFiltered / this.totalProcessed) * 100).toFixed(1) 
-        : '0.0'
-    };
   }
 }
 
@@ -326,28 +309,45 @@ class TelegramNotifier {
 }
 
 // ============================================================================
-// WEBSOCKET МЕНЕДЖЕР (глобальний стрім всіх ліквідацій)
+// WEBSOCKET МЕНЕДЖЕР (підписка тільки на валідні токени)
 // ============================================================================
 
 class BinanceWebSocketManager {
-  constructor(aggregator) {
+  constructor(aggregator, tokenFilter) {
     this.aggregator = aggregator;
+    this.tokenFilter = tokenFilter;
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 5000;
     this.isConnected = false;
+    this.subscribedTokens = new Set();
   }
 
-  connect() {
-    console.log('[WS] Підключення до Binance Futures (ALL liquidations)...');
+  async connect() {
+    const validTokens = this.tokenFilter.getValidTokens();
     
-    this.ws = new WebSocket(CONFIG.BINANCE_WS);
+    if (validTokens.length === 0) {
+      console.error('[WS] Немає валідних токенів для підписки!');
+      return;
+    }
+
+    console.log(`[WS] Підключення до Binance Futures (${validTokens.length} токенів)...`);
+    
+    // Формуємо список стрімів тільки для валідних токенів
+    const streams = validTokens.map(symbol => 
+      `${symbol.toLowerCase()}@forceOrder`
+    );
+
+    const wsUrl = CONFIG.BINANCE_WS_BASE + streams.join('/');
+    this.ws = new WebSocket(wsUrl);
 
     this.ws.on('open', () => {
-      console.log('[WS] ✅ Підключено до глобального стріму ліквідацій');
+      console.log('[WS] ✅ Підключено');
+      console.log(`[WS] 📡 Підписано на ${validTokens.length} токенів`);
       this.isConnected = true;
       this.reconnectAttempts = 0;
+      this.subscribedTokens = new Set(validTokens);
     });
 
     this.ws.on('message', (data) => {
@@ -369,18 +369,18 @@ class BinanceWebSocketManager {
     try {
       const message = JSON.parse(data);
       
-      // Binance надсилає об'єкт з полем "o" (order)
-      if (!message.o) return;
+      // Формат: { stream: "btcusdt@forceOrder", data: { o: {...} } }
+      if (!message.data || !message.data.o) return;
 
-      const order = message.o;
-      
+      const order = message.data.o;
       const symbol = order.s;
+      
       const side = order.S === 'BUY' ? 'SHORT' : 'LONG';
       const price = parseFloat(order.p);
       const quantity = parseFloat(order.q);
       const volumeUSD = price * quantity;
 
-      // Додаємо в агрегатор (фільтрація всередині)
+      // Додаємо в агрегатор (тільки валідні токени приходять з WS)
       this.aggregator.addLiquidation(symbol, {
         side,
         price,
@@ -392,6 +392,21 @@ class BinanceWebSocketManager {
     } catch (error) {
       // Мовчки ігноруємо помилки парсингу
     }
+  }
+
+  async resubscribe() {
+    console.log('[WS] 🔄 Переподписка на оновлений список токенів...');
+    
+    // Закриваємо старе з'єднання
+    if (this.ws) {
+      this.ws.close();
+    }
+
+    // Чекаємо трохи
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Підключаємось знову з новим списком
+    await this.connect();
   }
 
   reconnect() {
@@ -420,14 +435,12 @@ class BinanceWebSocketManager {
 // ============================================================================
 
 class AlertEngine {
-  constructor(aggregator, detector, cooldownManager, notifier, tokenFilter) {
+  constructor(aggregator, detector, cooldownManager, notifier) {
     this.aggregator = aggregator;
     this.detector = detector;
     this.cooldownManager = cooldownManager;
     this.notifier = notifier;
-    this.tokenFilter = tokenFilter;
     this.checkInterval = null;
-    this.statsInterval = null;
   }
 
   start() {
@@ -436,23 +449,12 @@ class AlertEngine {
     this.checkInterval = setInterval(() => {
       this.checkAllWindows();
     }, CONFIG.CHECK_INTERVAL_SEC * 1000);
-
-    // Періодична статистика фільтрації
-    this.statsInterval = setInterval(() => {
-      const stats = this.aggregator.getStats();
-      console.log(`[STATS] Оброблено: ${stats.totalProcessed} | Відфільтровано: ${stats.totalFiltered} (${stats.filterRate}%)`);
-    }, 60000); // Кожну хвилину
   }
 
   checkAllWindows() {
     const symbols = this.aggregator.getAllActiveSymbols();
     
     for (const symbol of symbols) {
-      // Додаткова перевірка фільтра (на випадок оновлення)
-      if (!this.tokenFilter.isValid(symbol)) {
-        continue;
-      }
-
       const stats = this.aggregator.getWindowStats(symbol);
       
       if (!stats) continue;
@@ -489,9 +491,6 @@ class AlertEngine {
     if (this.checkInterval) {
       clearInterval(this.checkInterval);
     }
-    if (this.statsInterval) {
-      clearInterval(this.statsInterval);
-    }
   }
 }
 
@@ -502,10 +501,7 @@ class AlertEngine {
 class BinanceLiquidationBot {
   constructor() {
     this.tokenFilter = new TokenFilter(CONFIG.FILTER_CONFIG);
-    this.aggregator = new LiquidationAggregator(
-      CONFIG.AGGREGATION_WINDOW_SEC,
-      this.tokenFilter
-    );
+    this.aggregator = new LiquidationAggregator(CONFIG.AGGREGATION_WINDOW_SEC);
     this.detector = new SignalDetector();
     this.cooldownManager = new CooldownManager(
       CONFIG.COOLDOWN_MINUTES,
@@ -515,50 +511,60 @@ class BinanceLiquidationBot {
       CONFIG.TELEGRAM_TOKEN,
       CONFIG.TELEGRAM_CHAT_IDS
     );
-    this.wsManager = new BinanceWebSocketManager(this.aggregator);
+    this.wsManager = new BinanceWebSocketManager(this.aggregator, this.tokenFilter);
     this.alertEngine = new AlertEngine(
       this.aggregator,
       this.detector,
       this.cooldownManager,
-      this.notifier,
-      this.tokenFilter
+      this.notifier
     );
+
+    // Слухаємо оновлення фільтра для переподписки
+    this.setupFilterUpdateListener();
+  }
+
+  setupFilterUpdateListener() {
+    // Перевіряємо оновлення фільтра кожні 2 години + 1 хвилину
+    const checkInterval = CONFIG.FILTER_CONFIG.UPDATE_INTERVAL_HOURS * 60 * 60 * 1000 + 60000;
+    
+    setInterval(async () => {
+      console.log('[BOT] 🔄 Час переподписатися на оновлений список токенів...');
+      await this.wsManager.resubscribe();
+    }, checkInterval);
   }
 
   async start() {
     console.log('='.repeat(70));
     console.log('BINANCE FUTURES LIQUIDATION ALERT BOT');
-    console.log('🎯 Підписка на ВСІ токени → фільтрація по MCAP');
+    console.log('🎯 Отримати токени Binance → Перевірити MCAP → Підписатись');
     console.log('='.repeat(70));
     console.log(`Мін об'єм: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
     console.log(`Мін домінування: ${CONFIG.MIN_DOMINANCE}%`);
     console.log(`Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SEC}с`);
     console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хв`);
-    console.log(`Dedup вікно: ${CONFIG.DEDUP_WINDOW_SEC}с`);
     console.log('='.repeat(70));
-    console.log('ФІЛЬТР ТОКЕНІВ (тільки MCAP):');
-    console.log(`  MCAP: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_MCAP_USD)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_MCAP_USD)}`);
+    console.log('ФІЛЬТР ТОКЕНІВ (MCAP):');
+    console.log(`  Діапазон: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_MCAP_USD)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_MCAP_USD)}`);
     console.log(`  Оновлення: кожні ${CONFIG.FILTER_CONFIG.UPDATE_INTERVAL_HOURS}год`);
     console.log('='.repeat(70));
 
     // Ініціалізація фільтра токенів
-    console.log('\n⏳ Завантаження Market Cap даних з CoinGecko...');
+    console.log('\n⏳ Аналіз токенів Binance Futures та їх Market Cap...');
     await this.tokenFilter.initialize();
 
     const stats = this.tokenFilter.getStats();
-    console.log('\n[FILTER] Статистика:');
-    console.log(`  • Всього валідних токенів: ${stats.total}`);
-    console.log(`  • Діапазон MCAP: ${stats.config.mcapRange}\n`);
+    console.log('\n📊 ФІЛЬТРАЦІЯ ЗАВЕРШЕНА');
+    console.log(`   Валідних токенів: ${stats.total}`);
+    console.log(`   Діапазон: ${stats.config.mcapRange}\n`);
 
     // Тест Telegram
     try {
       await this.notifier.sendStatus(
         '🚀 Binance Liquidation Bot запущено\n\n' +
-        `✅ Мін об\'єм: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M\n` +
-        `✅ Мін домінування: ${CONFIG.MIN_DOMINANCE}%\n` +
-        `✅ Вікно: ${CONFIG.AGGREGATION_WINDOW_SEC}с\n` +
         `✅ Валідних токенів: ${stats.total}\n` +
-        `📊 MCAP: ${stats.config.mcapRange}`
+        `✅ MCAP діапазон: ${stats.config.mcapRange}\n` +
+        `✅ Мін об\'єм: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M\n` +
+        `✅ Мін домінування: ${CONFIG.MIN_DOMINANCE}%`
       );
       console.log('[TELEGRAM] ✅ Підключено\n');
     } catch (error) {
@@ -566,8 +572,8 @@ class BinanceLiquidationBot {
       process.exit(1);
     }
 
-    // Запуск WebSocket (глобальний стрім)
-    this.wsManager.connect();
+    // Запуск WebSocket (підписка тільки на валідні токени)
+    await this.wsManager.connect();
 
     // Запуск движка алертів
     this.alertEngine.start();
