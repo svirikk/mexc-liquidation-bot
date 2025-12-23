@@ -1,6 +1,6 @@
 // ============================================================================
 // TOKEN FILTER MODULE
-// Фільтрація токенів за Market Cap та Open Interest
+// Фільтрація токенів за Market Cap (тільки MCAP, без OI)
 // ============================================================================
 
 const https = require('https');
@@ -9,7 +9,7 @@ class TokenFilter {
   constructor(config) {
     this.config = config;
     this.validTokens = new Set();
-    this.tokenMetadata = new Map(); // symbol -> { mcap, oi, lastUpdate }
+    this.tokenMetadata = new Map(); // symbol -> { mcap, lastUpdate }
     this.updateInterval = null;
     this.isInitialized = false;
   }
@@ -44,11 +44,8 @@ class TokenFilter {
     try {
       const startTime = Date.now();
       
-      // Отримуємо дані з обох джерел
-      const [openInterestData, marketCapData] = await Promise.all([
-        this.fetchOpenInterest(),
-        this.fetchMarketCap()
-      ]);
+      // Отримуємо дані з CoinGecko
+      const marketCapData = await this.fetchMarketCap();
 
       // Старий список для порівняння
       const oldTokens = new Set(this.validTokens);
@@ -57,29 +54,13 @@ class TokenFilter {
       const newValidTokens = new Set();
       const newMetadata = new Map();
 
-      // Об'єднуємо дані та фільтруємо
-      const allSymbols = new Set([
-        ...Object.keys(openInterestData),
-        ...Object.keys(marketCapData)
-      ]);
-
-      for (const symbol of allSymbols) {
-        const oi = openInterestData[symbol] || 0;
-        const mcap = marketCapData[symbol] || 0;
-
-        // Перевірка критеріїв
-        const isValidByOI = this.isValidOpenInterest(oi);
-        const isValidByMCAP = this.isValidMarketCap(mcap);
-
-        // Токен валідний, якщо хоча б одна умова виконується
-        if (isValidByOI || isValidByMCAP) {
+      // Фільтруємо за MCAP
+      for (const [symbol, mcap] of Object.entries(marketCapData)) {
+        if (this.isValidMarketCap(mcap)) {
           newValidTokens.add(symbol);
           newMetadata.set(symbol, {
-            oi,
             mcap,
-            lastUpdate: Date.now(),
-            validByOI: isValidByOI,
-            validByMCAP: isValidByMCAP
+            lastUpdate: Date.now()
           });
         }
       }
@@ -103,6 +84,9 @@ class TokenFilter {
       if (added.length > 0) {
         console.log(`  • Нові токени: ${added.slice(0, 5).join(', ')}${added.length > 5 ? '...' : ''}`);
       }
+      if (removed.length > 0) {
+        console.log(`  • Видалені токени: ${removed.slice(0, 5).join(', ')}${removed.length > 5 ? '...' : ''}`);
+      }
 
       return { added, removed, total: this.validTokens.size };
 
@@ -114,81 +98,44 @@ class TokenFilter {
   }
 
   /**
-   * Отримання Open Interest з Binance (через ticker з 24hr статистикою)
-   */
-  async fetchOpenInterest() {
-    try {
-      // Спочатку отримуємо список всіх символів з OI
-      const tickerData = await this.httpsGet('https://fapi.binance.com/fapi/v1/ticker/24hr');
-      
-      if (!Array.isArray(tickerData)) {
-        throw new Error('Некоректний формат даних ticker');
-      }
-
-      const oiMap = {};
-      
-      // Для кожного символу отримуємо його ціну та OI
-      for (const ticker of tickerData) {
-        if (!ticker.symbol || !ticker.symbol.endsWith('USDT')) {
-          continue;
-        }
-
-        const symbol = ticker.symbol;
-        const price = parseFloat(ticker.lastPrice) || 0;
-        
-        if (price === 0) continue;
-
-        try {
-          // Отримуємо OI для конкретного символу
-          const oiData = await this.httpsGet(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`);
-          
-          if (oiData && oiData.openInterest) {
-            const oi = parseFloat(oiData.openInterest);
-            const oiUSD = oi * price;
-            oiMap[symbol] = oiUSD;
-          }
-        } catch (err) {
-          // Ігноруємо помилки для окремих символів
-        }
-        
-        // Затримка щоб не перевантажити API (weight limit)
-        await this.sleep(50);
-      }
-
-      console.log(`[FILTER] OI: отримано ${Object.keys(oiMap).length} токенів`);
-      return oiMap;
-
-    } catch (error) {
-      console.error('[FILTER] Помилка отримання OI:', error.message);
-      return {};
-    }
-  }
-
-  /**
    * Отримання Market Cap з CoinGecko
+   * Отримуємо всі монети (не тільки top 250), щоб покрити весь діапазон $10M-$150M
    */
   async fetchMarketCap() {
     try {
-      // Отримуємо top 250 монет за market cap
-      const data = await this.httpsGet(
-        'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false'
-      );
-
-      if (!Array.isArray(data)) {
-        throw new Error('Некоректний формат даних MCAP');
-      }
-
       const mcapMap = {};
+      const perPage = 250;
+      
+      // Отримуємо перші 4 сторінки (1000 монет) - цього достатньо для покриття $10M+
+      for (let page = 1; page <= 4; page++) {
+        try {
+          const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=${page}&sparkline=false`;
+          const data = await this.httpsGet(url);
 
-      for (const coin of data) {
-        if (coin.symbol && coin.market_cap) {
-          // Конвертуємо symbol в формат Binance (BTC -> BTCUSDT)
-          const symbol = coin.symbol.toUpperCase() + 'USDT';
-          mcapMap[symbol] = coin.market_cap;
+          if (!Array.isArray(data)) {
+            console.error(`[FILTER] Некоректний формат даних MCAP (сторінка ${page})`);
+            continue;
+          }
+
+          for (const coin of data) {
+            if (coin.symbol && coin.market_cap) {
+              // Конвертуємо symbol в формат Binance (btc -> BTCUSDT)
+              const symbol = coin.symbol.toUpperCase() + 'USDT';
+              mcapMap[symbol] = coin.market_cap;
+            }
+          }
+
+          console.log(`[FILTER] MCAP: отримано сторінку ${page} (${Object.keys(mcapMap).length} токенів загалом)`);
+          
+          // Затримка між запитами (CoinGecko rate limit)
+          await this.sleep(1200);
+          
+        } catch (error) {
+          console.error(`[FILTER] Помилка отримання MCAP сторінки ${page}:`, error.message);
         }
       }
 
-      console.log(`[FILTER] MCAP: отримано ${Object.keys(mcapMap).length} токенів`);
+      console.log(`[FILTER] MCAP: фінально отримано ${Object.keys(mcapMap).length} токенів`);
       return mcapMap;
 
     } catch (error) {
@@ -200,10 +147,13 @@ class TokenFilter {
   /**
    * HTTPS GET запит з timeout
    */
-  httpsGet(url, timeout = 10000) {
+  httpsGet(url, timeout = 15000) {
     return new Promise((resolve, reject) => {
       const req = https.get(url, {
-        headers: { 'User-Agent': 'Binance-Liquidation-Bot' },
+        headers: { 
+          'User-Agent': 'Binance-Liquidation-Bot',
+          'Accept': 'application/json'
+        },
         timeout: timeout
       }, (res) => {
         let data = '';
@@ -211,6 +161,16 @@ class TokenFilter {
         res.on('data', chunk => data += chunk);
         
         res.on('end', () => {
+          if (res.statusCode === 429) {
+            reject(new Error('Rate limit exceeded'));
+            return;
+          }
+          
+          if (res.statusCode !== 200) {
+            reject(new Error(`HTTP ${res.statusCode}`));
+            return;
+          }
+          
           try {
             resolve(JSON.parse(data));
           } catch (error) {
@@ -232,13 +192,6 @@ class TokenFilter {
    */
   sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Перевірка валідності Open Interest
-   */
-  isValidOpenInterest(oi) {
-    return oi >= this.config.MIN_OI_USD && oi <= this.config.MAX_OI_USD;
   }
 
   /**
@@ -273,20 +226,9 @@ class TokenFilter {
    * Отримання статистики
    */
   getStats() {
-    const validByOI = Array.from(this.tokenMetadata.values())
-      .filter(m => m.validByOI).length;
-    const validByMCAP = Array.from(this.tokenMetadata.values())
-      .filter(m => m.validByMCAP).length;
-    const validByBoth = Array.from(this.tokenMetadata.values())
-      .filter(m => m.validByOI && m.validByMCAP).length;
-
     return {
       total: this.validTokens.size,
-      validByOI,
-      validByMCAP,
-      validByBoth,
       config: {
-        oiRange: `$${this.formatNumber(this.config.MIN_OI_USD)} - $${this.formatNumber(this.config.MAX_OI_USD)}`,
         mcapRange: `$${this.formatNumber(this.config.MIN_MCAP_USD)} - $${this.formatNumber(this.config.MAX_MCAP_USD)}`
       }
     };
