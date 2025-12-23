@@ -22,8 +22,8 @@ const { TokenFilter } = require('./token-filter');
 // ============================================================================
 
 const CONFIG = {
-  // WebSocket - множинні стріми для валідних токенів
-  BINANCE_WS_BASE: 'wss://fstream.binance.com/stream?streams=',
+  // WebSocket - глобальний стрім всіх ліквідацій (фільтрація на рівні обробки)
+  BINANCE_WS: 'wss://fstream.binance.com/ws/!forceOrder@arr',
   
   // Пороги алертів
   MIN_LIQUIDATION_USD: parseInt(process.env.MIN_LIQUIDATION_USD) || 1_000_000,
@@ -321,33 +321,21 @@ class BinanceWebSocketManager {
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 5000;
     this.isConnected = false;
-    this.subscribedTokens = new Set();
+    this.processedCount = 0;
+    this.filteredCount = 0;
   }
 
-  async connect() {
-    const validTokens = this.tokenFilter.getValidTokens();
+  connect() {
+    console.log('[WS] Підключення до Binance Futures (глобальний стрім)...');
     
-    if (validTokens.length === 0) {
-      console.error('[WS] Немає валідних токенів для підписки!');
-      return;
-    }
-
-    console.log(`[WS] Підключення до Binance Futures (${validTokens.length} токенів)...`);
-    
-    // Формуємо список стрімів тільки для валідних токенів
-    const streams = validTokens.map(symbol => 
-      `${symbol.toLowerCase()}@forceOrder`
-    );
-
-    const wsUrl = CONFIG.BINANCE_WS_BASE + streams.join('/');
-    this.ws = new WebSocket(wsUrl);
+    this.ws = new WebSocket(CONFIG.BINANCE_WS);
 
     this.ws.on('open', () => {
-      console.log('[WS] ✅ Підключено');
-      console.log(`[WS] 📡 Підписано на ${validTokens.length} токенів`);
+      const validCount = this.tokenFilter.getValidTokens().length;
+      console.log('[WS] ✅ Підключено до глобального стріму');
+      console.log(`[WS] 🎯 Фільтрація на рівні обробки (${validCount} валідних токенів)`);
       this.isConnected = true;
       this.reconnectAttempts = 0;
-      this.subscribedTokens = new Set(validTokens);
     });
 
     this.ws.on('message', (data) => {
@@ -369,18 +357,26 @@ class BinanceWebSocketManager {
     try {
       const message = JSON.parse(data);
       
-      // Формат: { stream: "btcusdt@forceOrder", data: { o: {...} } }
-      if (!message.data || !message.data.o) return;
+      // Binance надсилає об'єкт з полем "o" (order)
+      if (!message.o) return;
 
-      const order = message.data.o;
+      const order = message.o;
       const symbol = order.s;
+      
+      this.processedCount++;
+      
+      // КРИТИЧНО: Фільтрація по MCAP перед обробкою
+      if (!this.tokenFilter.isValid(symbol)) {
+        this.filteredCount++;
+        return;
+      }
       
       const side = order.S === 'BUY' ? 'SHORT' : 'LONG';
       const price = parseFloat(order.p);
       const quantity = parseFloat(order.q);
       const volumeUSD = price * quantity;
 
-      // Додаємо в агрегатор (тільки валідні токени приходять з WS)
+      // Додаємо в агрегатор (тільки валідні токени)
       this.aggregator.addLiquidation(symbol, {
         side,
         price,
@@ -394,19 +390,14 @@ class BinanceWebSocketManager {
     }
   }
 
-  async resubscribe() {
-    console.log('[WS] 🔄 Переподписка на оновлений список токенів...');
-    
-    // Закриваємо старе з'єднання
-    if (this.ws) {
-      this.ws.close();
-    }
-
-    // Чекаємо трохи
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Підключаємось знову з новим списком
-    await this.connect();
+  getStats() {
+    return {
+      processed: this.processedCount,
+      filtered: this.filteredCount,
+      filterRate: this.processedCount > 0 
+        ? ((this.filteredCount / this.processedCount) * 100).toFixed(1)
+        : '0.0'
+    };
   }
 
   reconnect() {
@@ -441,14 +432,23 @@ class AlertEngine {
     this.cooldownManager = cooldownManager;
     this.notifier = notifier;
     this.checkInterval = null;
+    this.statsInterval = null;
   }
 
-  start() {
+  start(wsManager) {
     console.log(`[ENGINE] Запуск перевірки кожні ${CONFIG.CHECK_INTERVAL_SEC}с`);
     
     this.checkInterval = setInterval(() => {
       this.checkAllWindows();
     }, CONFIG.CHECK_INTERVAL_SEC * 1000);
+
+    // Статистика фільтрації кожну хвилину
+    this.statsInterval = setInterval(() => {
+      if (wsManager) {
+        const stats = wsManager.getStats();
+        console.log(`[STATS] Оброблено: ${stats.processed} | Відфільтровано: ${stats.filtered} (${stats.filterRate}%)`);
+      }
+    }, 60000);
   }
 
   checkAllWindows() {
@@ -491,6 +491,9 @@ class AlertEngine {
     if (this.checkInterval) {
       clearInterval(this.checkInterval);
     }
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+    }
   }
 }
 
@@ -524,19 +527,14 @@ class BinanceLiquidationBot {
   }
 
   setupFilterUpdateListener() {
-    // Перевіряємо оновлення фільтра кожні 2 години + 1 хвилину
-    const checkInterval = CONFIG.FILTER_CONFIG.UPDATE_INTERVAL_HOURS * 60 * 60 * 1000 + 60000;
-    
-    setInterval(async () => {
-      console.log('[BOT] 🔄 Час переподписатися на оновлений список токенів...');
-      await this.wsManager.resubscribe();
-    }, checkInterval);
+    // Оновлення фільтра не потребує переподписки (фільтрація на рівні обробки)
+    // Просто логуємо коли список оновлено
   }
 
   async start() {
     console.log('='.repeat(70));
     console.log('BINANCE FUTURES LIQUIDATION ALERT BOT');
-    console.log('🎯 Отримати токени Binance → Перевірити MCAP → Підписатись');
+    console.log('🎯 Глобальний стрім → Фільтрація по MCAP');
     console.log('='.repeat(70));
     console.log(`Мін об'єм: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
     console.log(`Мін домінування: ${CONFIG.MIN_DOMINANCE}%`);
@@ -572,11 +570,11 @@ class BinanceLiquidationBot {
       process.exit(1);
     }
 
-    // Запуск WebSocket (підписка тільки на валідні токени)
-    await this.wsManager.connect();
+    // Запуск WebSocket (глобальний стрім)
+    this.wsManager.connect();
 
     // Запуск движка алертів
-    this.alertEngine.start();
+    this.alertEngine.start(this.wsManager);
 
     // Обробники завершення
     process.on('SIGINT', () => this.shutdown());
