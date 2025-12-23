@@ -1,7 +1,6 @@
 // ============================================================================
-// TOKEN FILTER MODULE
-// Фільтрація токенів за Market Cap
-// Альтернативний метод БЕЗ Binance API (для обходу HTTP 451)
+// TOKEN FILTER MODULE (ENHANCED)
+// Фільтрація токенів за Market Cap + 24h Volume
 // ============================================================================
 
 const https = require('https');
@@ -36,25 +35,44 @@ class TokenFilter {
     try {
       const startTime = Date.now();
       
-      // Отримуємо токени з CoinGecko (вони мають інфу про futures)
-      console.log('[FILTER] Отримання токенів та їх Market Cap з CoinGecko...');
+      // Крок 1: Отримуємо MCAP з CoinGecko
+      console.log('[FILTER] Отримання Market Cap з CoinGecko...');
       const tokensWithMcap = await this.fetchTokensFromCoinGecko();
-      
-      console.log(`[FILTER] Отримано ${tokensWithMcap.length} токенів з MCAP даними`);
+      console.log(`[FILTER] Отримано ${tokensWithMcap.length} токенів з MCAP`);
 
-      // Фільтруємо за діапазоном MCAP
+      // Крок 2: Отримуємо 24h volume з Binance
+      console.log('[FILTER] Отримання 24h Volume з Binance...');
+      const binanceVolumes = await this.fetchBinanceFuturesVolumes();
+      console.log(`[FILTER] Отримано ${binanceVolumes.size} токенів з Binance`);
+
+      // Крок 3: Об'єднуємо дані та фільтруємо
       const oldTokens = new Set(this.validTokens);
       const newValidTokens = new Set();
       const newMetadata = new Map();
 
-      let inRange = 0;
+      let mcapPassed = 0;
+      let volumePassed = 0;
+      let bothPassed = 0;
 
       for (const { symbol, mcap } of tokensWithMcap) {
-        if (this.isValidMarketCap(mcap)) {
-          inRange++;
+        const volume24h = binanceVolumes.get(symbol);
+        
+        // Пропускаємо якщо немає даних з Binance
+        if (!volume24h) continue;
+
+        const mcapValid = this.isValidMarketCap(mcap);
+        const volumeValid = this.isValidVolume(volume24h);
+
+        if (mcapValid) mcapPassed++;
+        if (volumeValid) volumePassed++;
+
+        // Токен валідний ТІЛЬКИ якщо проходить ОБА фільтри
+        if (mcapValid && volumeValid) {
+          bothPassed++;
           newValidTokens.add(symbol);
           newMetadata.set(symbol, {
             mcap,
+            volume24h,
             lastUpdate: Date.now()
           });
         }
@@ -70,24 +88,26 @@ class TokenFilter {
       
       console.log('[FILTER] ═══════════════════════════════════════');
       console.log('[FILTER] Оновлення завершено:');
-      console.log(`  • Всього токенів: ${tokensWithMcap.length}`);
-      console.log(`  • В діапазоні MCAP: ${inRange}`);
-      console.log(`  • Валідних токенів: ${this.validTokens.size}`);
+      console.log(`  • Всього токенів CoinGecko: ${tokensWithMcap.length}`);
+      console.log(`  • З даними Binance: ${binanceVolumes.size}`);
+      console.log(`  • Пройшли MCAP: ${mcapPassed}`);
+      console.log(`  • Пройшли Volume: ${volumePassed}`);
+      console.log(`  • Валідних (обидва): ${bothPassed}`);
       console.log(`  • Додано: ${added.length}`);
       console.log(`  • Видалено: ${removed.length}`);
       console.log(`  • Тривалість: ${(duration / 1000).toFixed(1)}с`);
       console.log('[FILTER] ═══════════════════════════════════════');
 
-      if (added.length > 0 && added.length <= 10) {
-        console.log(`[FILTER] Нові токени: ${added.join(', ')}`);
-      } else if (added.length > 10) {
-        console.log(`[FILTER] Нові токени: ${added.slice(0, 10).join(', ')}... (+${added.length - 10})`);
+      if (added.length > 0 && added.length <= 15) {
+        console.log(`[FILTER] ✅ Нові токени: ${added.join(', ')}`);
+      } else if (added.length > 15) {
+        console.log(`[FILTER] ✅ Нові токени: ${added.slice(0, 15).join(', ')}... (+${added.length - 15})`);
       }
 
-      if (removed.length > 0 && removed.length <= 10) {
-        console.log(`[FILTER] Видалені: ${removed.join(', ')}`);
-      } else if (removed.length > 10) {
-        console.log(`[FILTER] Видалені: ${removed.slice(0, 10).join(', ')}... (+${removed.length - 10})`);
+      if (removed.length > 0 && removed.length <= 15) {
+        console.log(`[FILTER] ❌ Видалені: ${removed.join(', ')}`);
+      } else if (removed.length > 15) {
+        console.log(`[FILTER] ❌ Видалені: ${removed.slice(0, 15).join(', ')}... (+${removed.length - 15})`);
       }
 
       return { added, removed, total: this.validTokens.size };
@@ -99,14 +119,43 @@ class TokenFilter {
   }
 
   /**
-   * Отримання токенів з CoinGecko (обходимо Binance API)
+   * Отримання 24h Volume з Binance Futures
+   */
+  async fetchBinanceFuturesVolumes() {
+    try {
+      const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
+      const data = await this.httpsGet(url);
+
+      if (!Array.isArray(data)) {
+        throw new Error('Некоректний формат відповіді Binance');
+      }
+
+      const volumes = new Map();
+
+      for (const ticker of data) {
+        if (ticker.symbol && ticker.quoteVolume) {
+          const symbol = ticker.symbol; // Вже в форматі BTCUSDT
+          const volume24h = parseFloat(ticker.quoteVolume);
+          volumes.set(symbol, volume24h);
+        }
+      }
+
+      return volumes;
+
+    } catch (error) {
+      console.error('[FILTER] Помилка отримання Binance volumes:', error.message);
+      return new Map();
+    }
+  }
+
+  /**
+   * Отримання токенів з CoinGecko
    */
   async fetchTokensFromCoinGecko() {
     try {
       const tokens = [];
       const perPage = 250;
       
-      // Отримуємо достатньо сторінок
       for (let page = 1; page <= 5; page++) {
         try {
           const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=${page}&sparkline=false`;
@@ -119,7 +168,6 @@ class TokenFilter {
 
           for (const coin of data) {
             if (coin.symbol && coin.market_cap) {
-              // Конвертуємо в формат Binance USDT
               const symbol = coin.symbol.toUpperCase() + 'USDT';
               tokens.push({
                 symbol,
@@ -128,9 +176,8 @@ class TokenFilter {
             }
           }
 
-          console.log(`[FILTER] CoinGecko сторінка ${page}: ${data.length} монет (всього: ${tokens.length})`);
+          console.log(`[FILTER] CoinGecko сторінка ${page}: ${data.length} монет`);
           
-          // Rate limit
           if (page < 5) {
             await this.sleep(1300);
           }
@@ -199,6 +246,10 @@ class TokenFilter {
     return mcap >= this.config.MIN_MCAP_USD && mcap <= this.config.MAX_MCAP_USD;
   }
 
+  isValidVolume(volume) {
+    return volume >= this.config.MIN_VOLUME_24H && volume <= this.config.MAX_VOLUME_24H;
+  }
+
   isValid(symbol) {
     return this.validTokens.has(symbol);
   }
@@ -215,7 +266,8 @@ class TokenFilter {
     return {
       total: this.validTokens.size,
       config: {
-        mcapRange: `$${this.formatNumber(this.config.MIN_MCAP_USD)} - $${this.formatNumber(this.config.MAX_MCAP_USD)}`
+        mcapRange: `$${this.formatNumber(this.config.MIN_MCAP_USD)} - $${this.formatNumber(this.config.MAX_MCAP_USD)}`,
+        volumeRange: `$${this.formatNumber(this.config.MIN_VOLUME_24H)} - $${this.formatNumber(this.config.MAX_VOLUME_24H)}`
       }
     };
   }
