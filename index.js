@@ -1,12 +1,7 @@
 // ============================================================================
-// BINANCE FUTURES LIQUIDATION ALERT BOT
+// BINANCE FUTURES LIQUIDATION ALERT BOT (ENHANCED)
 // Моніторинг масових ліквідацій для reversal-трейдингу
-// 
-// ЛОГІКА:
-// 1. Отримати ВСІ токени з Binance Futures
-// 2. Перевірити MCAP кожного на CoinGecko
-// 3. Підписатись ТІЛЬКИ на валідні (в діапазоні MCAP)
-// 4. Оновлювати список кожні 2 години
+// + Фільтр зміни ціни + Фільтр 24h volume
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -22,21 +17,19 @@ const { TokenFilter } = require('./token-filter');
 // ============================================================================
 
 const CONFIG = {
-  // WebSocket - глобальний стрім всіх ліквідацій (фільтрація на рівні обробки)
+  // WebSocket
   BINANCE_WS: 'wss://fstream.binance.com/ws/!forceOrder@arr',
   
   // Пороги алертів
   MIN_LIQUIDATION_USD: parseInt(process.env.MIN_LIQUIDATION_USD) || 1_000_000,
   MIN_DOMINANCE: parseFloat(process.env.MIN_DOMINANCE) || 65.0,
   
-  // Додаткові фільтри агресії
-  MIN_PRICE_CHANGE_PERCENT: parseFloat(process.env.MIN_PRICE_CHANGE_PERCENT) || 3.0,
-  PRICE_CHANGE_WINDOW_SEC: parseInt(process.env.PRICE_CHANGE_WINDOW_SEC) || 180, // 3 хв
+  // 🆕 ФІЛЬТР ЗМІНИ ЦІНИ
+  MIN_PRICE_CHANGE_PERCENT: parseFloat(process.env.MIN_PRICE_CHANGE_PERCENT) || 2.0,
+  MAX_PRICE_CHANGE_PERCENT: parseFloat(process.env.MAX_PRICE_CHANGE_PERCENT) || 10.0,
+  PRICE_CHANGE_WINDOW_SEC: parseInt(process.env.PRICE_CHANGE_WINDOW_SEC) || 240, // 4 хв
   
-  AGGRESSIVE_VOLUME_USD: parseInt(process.env.AGGRESSIVE_VOLUME_USD) || 1_000_000,
-  AGGRESSIVE_VOLUME_WINDOW_SEC: parseInt(process.env.AGGRESSIVE_VOLUME_WINDOW_SEC) || 300, // 5 хв
-  
-  // Часове вікно агрегації (секунди)
+  // Часове вікно агрегації ліквідацій
   AGGREGATION_WINDOW_SEC: parseInt(process.env.AGGREGATION_WINDOW_SEC) || 180,
   
   // Anti-spam
@@ -46,10 +39,12 @@ const CONFIG = {
   // Перевірка вікон
   CHECK_INTERVAL_SEC: parseInt(process.env.CHECK_INTERVAL_SEC) || 15,
   
-  // Фільтр токенів (тільки MCAP)
+  // Фільтр токенів
   FILTER_CONFIG: {
     MIN_MCAP_USD: parseInt(process.env.MIN_MCAP_USD) || 10_000_000,
     MAX_MCAP_USD: parseInt(process.env.MAX_MCAP_USD) || 150_000_000,
+    MIN_VOLUME_24H: parseInt(process.env.MIN_VOLUME_24H) || 20_000_000,      // 🆕 20M
+    MAX_VOLUME_24H: parseInt(process.env.MAX_VOLUME_24H) || 200_000_000,     // 🆕 200M
     UPDATE_INTERVAL_HOURS: parseInt(process.env.FILTER_UPDATE_HOURS) || 2,
   },
   
@@ -61,129 +56,79 @@ const CONFIG = {
 };
 
 // ============================================================================
-// PRICE TRACKER (відстеження ціни в реальному часі)
+// 🆕 PRICE TRACKER (для відстеження зміни ціни)
 // ============================================================================
 
 class PriceTracker {
-  constructor() {
-    this.prices = new Map(); // symbol -> { price, timestamp, history: [] }
-    this.ws = null;
-    this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 10;
-    this.reconnectDelay = 5000;
+  constructor(windowSeconds) {
+    this.prices = new Map(); // symbol -> [{price, timestamp}]
+    this.windowMs = windowSeconds * 1000;
   }
 
-  connect(symbols) {
-    console.log('[PRICE] 📊 Підключення до ticker stream...');
-    
-    // Підписуємося на міні-тікери для всіх символів
-    const streams = symbols.slice(0, 200).map(s => `${s.toLowerCase()}@miniTicker`);
-    const wsUrl = `wss://fstream.binance.com/stream?streams=${streams.join('/')}`;
-    
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.on('open', () => {
-      console.log(`[PRICE] ✅ Підключено (${symbols.length} символів)`);
-      this.reconnectAttempts = 0;
-    });
-
-    this.ws.on('message', (data) => {
-      try {
-        const message = JSON.parse(data);
-        if (message.data && message.data.s && message.data.c) {
-          const symbol = message.data.s;
-          const price = parseFloat(message.data.c);
-          const timestamp = Date.now();
-
-          if (!this.prices.has(symbol)) {
-            this.prices.set(symbol, {
-              price,
-              timestamp,
-              history: [{ price, timestamp }]
-            });
-          } else {
-            const tracker = this.prices.get(symbol);
-            tracker.price = price;
-            tracker.timestamp = timestamp;
-            tracker.history.push({ price, timestamp });
-            
-            // Зберігаємо історію тільки за останні 10 хвилин
-            const cutoff = timestamp - 600000;
-            tracker.history = tracker.history.filter(h => h.timestamp > cutoff);
-          }
-        }
-      } catch (error) {
-        // Ігноруємо помилки парсингу
-      }
-    });
-
-    this.ws.on('error', (error) => {
-      console.error('[PRICE] Помилка:', error.message);
-    });
-
-    this.ws.on('close', () => {
-      console.log('[PRICE] З\'єднання закрито');
-      this.reconnect(symbols);
-    });
-  }
-
-  reconnect(symbols) {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[PRICE] Досягнуто максимум спроб переподключення');
-      return;
+  addPrice(symbol, price) {
+    if (!this.prices.has(symbol)) {
+      this.prices.set(symbol, []);
     }
 
-    this.reconnectAttempts++;
-    console.log(`[PRICE] Переподключення через ${this.reconnectDelay / 1000}с...`);
-    
-    setTimeout(() => {
-      this.connect(symbols);
-    }, this.reconnectDelay);
+    const priceHistory = this.prices.get(symbol);
+    priceHistory.push({
+      price,
+      timestamp: Date.now()
+    });
+
+    this.cleanup(symbol);
   }
 
-  getCurrentPrice(symbol) {
-    const tracker = this.prices.get(symbol);
-    return tracker ? tracker.price : null;
-  }
-
-  getPriceChange(symbol, windowMs) {
-    const tracker = this.prices.get(symbol);
-    if (!tracker || tracker.history.length < 2) return null;
+  cleanup(symbol) {
+    if (!this.prices.has(symbol)) return;
 
     const now = Date.now();
-    const cutoff = now - windowMs;
+    const priceHistory = this.prices.get(symbol);
     
-    // Знаходимо найстарішу ціну в вікні
-    const oldPrices = tracker.history.filter(h => h.timestamp >= cutoff);
-    if (oldPrices.length === 0) return null;
+    const filtered = priceHistory.filter(p => now - p.timestamp < this.windowMs);
 
-    const oldestPrice = oldPrices[0].price;
-    const currentPrice = tracker.price;
+    if (filtered.length === 0) {
+      this.prices.delete(symbol);
+    } else {
+      this.prices.set(symbol, filtered);
+    }
+  }
+
+  getPriceChange(symbol) {
+    if (!this.prices.has(symbol)) return null;
+
+    const priceHistory = this.prices.get(symbol);
+    if (priceHistory.length < 2) return null;
+
+    const oldest = priceHistory[0].price;
+    const newest = priceHistory[priceHistory.length - 1].price;
     
-    const priceChange = ((currentPrice - oldestPrice) / oldestPrice) * 100;
-    
+    const changePercent = ((newest - oldest) / oldest) * 100;
+    const duration = (priceHistory[priceHistory.length - 1].timestamp - priceHistory[0].timestamp) / 1000;
+
     return {
-      startPrice: oldestPrice,
-      currentPrice,
-      priceChange
+      changePercent,
+      duration,
+      oldPrice: oldest,
+      newPrice: newest,
+      dataPoints: priceHistory.length
     };
   }
 
-  close() {
-    if (this.ws) {
-      this.ws.close();
-    }
+  reset(symbol) {
+    this.prices.delete(symbol);
   }
 }
 
 // ============================================================================
-// АГРЕГАТОР ЛІКВІДАЦІЙ (спрощений - без відстеження ціни)
+// АГРЕГАТОР ЛІКВІДАЦІЙ (модифікований для відстеження ціни)
 // ============================================================================
 
 class LiquidationAggregator {
-  constructor(windowSeconds) {
+  constructor(windowSeconds, priceTracker) {
     this.windows = new Map();
     this.windowMs = windowSeconds * 1000;
+    this.priceTracker = priceTracker;
   }
 
   addLiquidation(symbol, liquidation) {
@@ -196,6 +141,9 @@ class LiquidationAggregator {
 
     const window = this.windows.get(symbol);
     window.liquidations.push(liquidation);
+    
+    // 🆕 Додаємо ціну в price tracker
+    this.priceTracker.addPrice(symbol, liquidation.price);
     
     this.cleanup(symbol);
   }
@@ -217,7 +165,7 @@ class LiquidationAggregator {
     }
   }
 
-  getWindowStats(symbol, priceTracker) {
+  getWindowStats(symbol) {
     if (!this.windows.has(symbol)) return null;
 
     const window = this.windows.get(symbol);
@@ -246,13 +194,8 @@ class LiquidationAggregator {
     const now = Date.now();
     const durationSec = (now - window.startTime) / 1000;
 
-    // Отримуємо зміну ціни з PriceTracker
-    const windowMs = this.windowMs;
-    const priceData = priceTracker ? priceTracker.getPriceChange(symbol, windowMs) : null;
-    
-    const priceChange = priceData ? priceData.priceChange : 0;
-    const startPrice = priceData ? priceData.startPrice : 0;
-    const currentPrice = priceData ? priceData.currentPrice : 0;
+    // 🆕 Отримуємо зміну ціни
+    const priceChange = this.priceTracker.getPriceChange(symbol);
 
     return {
       symbol,
@@ -266,9 +209,7 @@ class LiquidationAggregator {
       count: window.liquidations.length,
       durationSec,
       timestamp: now,
-      startPrice,
-      lastPrice: currentPrice,
-      priceChange
+      priceChange // 🆕
     };
   }
 
@@ -278,47 +219,53 @@ class LiquidationAggregator {
 
   reset(symbol) {
     this.windows.delete(symbol);
+    this.priceTracker.reset(symbol);
   }
 }
 
 // ============================================================================
-// ДЕТЕКТОР СИГНАЛІВ (з агресивними фільтрами)
+// ДЕТЕКТОР СИГНАЛІВ (модифікований)
 // ============================================================================
 
 class SignalDetector {
   shouldAlert(stats) {
     if (!stats) return false;
 
-    // Базова перевірка мінімального об'єму
+    // Перевірка мінімального об'єму ліквідацій
     if (stats.totalVolumeUSD < CONFIG.MIN_LIQUIDATION_USD) {
       return false;
     }
 
-    // Базова перевірка домінування
+    // Перевірка домінування
     if (stats.dominance < CONFIG.MIN_DOMINANCE) {
       return false;
     }
 
-    // НОВИЙ ФІЛЬТР 1: Перевірка різкої зміни ціни
-    // Ціна має змінитись на мінімум MIN_PRICE_CHANGE_PERCENT%
-    if (Math.abs(stats.priceChange) < CONFIG.MIN_PRICE_CHANGE_PERCENT) {
-      return false;
-    }
+    // 🆕 ПЕРЕВІРКА ЗМІНИ ЦІНИ
+    if (stats.priceChange) {
+      const absChange = Math.abs(stats.priceChange.changePercent);
+      
+      // Ціна має змінитися в діапазоні MIN_PRICE_CHANGE_PERCENT - MAX_PRICE_CHANGE_PERCENT
+      if (absChange < CONFIG.MIN_PRICE_CHANGE_PERCENT) {
+        return false;
+      }
 
-    // НОВИЙ ФІЛЬТР 2: Перевірка агресивного об'єму
-    // Об'єм має досягти AGGRESSIVE_VOLUME_USD за період
-    if (stats.totalVolumeUSD < CONFIG.AGGRESSIVE_VOLUME_USD) {
-      return false;
-    }
+      if (absChange > CONFIG.MAX_PRICE_CHANGE_PERCENT) {
+        // Занадто велика зміна - можливо помилка або маніпуляція
+        return false;
+      }
 
-    // Додаткова валідація: напрямок ціни має відповідати домінуванню
-    // Якщо LONG ліквідується (SHORT домінує), ціна має падати
-    // Якщо SHORT ліквідується (LONG домінує), ціна має рости
-    if (stats.dominantSide === 'SHORT' && stats.priceChange > 0) {
-      return false; // SHORT домінує але ціна росте - невідповідність
-    }
-    if (stats.dominantSide === 'LONG' && stats.priceChange < 0) {
-      return false; // LONG домінує але ціна падає - невідповідність
+      // Напрямок зміни ціни має відповідати домінуванню:
+      // Якщо ліквідуються LONG позиції → ціна падає (негативна зміна)
+      // Якщо ліквідуються SHORT позиції → ціна росте (позитивна зміна)
+      if (stats.dominantSide === 'LONG' && stats.priceChange.changePercent > 0) {
+        // Ліквідація лонгів, але ціна росте - підозріло
+        return false;
+      }
+      if (stats.dominantSide === 'SHORT' && stats.priceChange.changePercent < 0) {
+        // Ліквідація шортів, але ціна падає - підозріло
+        return false;
+      }
     }
 
     return true;
@@ -326,23 +273,6 @@ class SignalDetector {
 
   getSignature(stats) {
     return `${stats.symbol}:${stats.dominantSide}:${Math.floor(stats.totalVolumeUSD / 100000)}`;
-  }
-
-  // Інтерпретація для логів
-  interpretSignal(stats) {
-    if (stats.dominantSide === 'SHORT') {
-      return {
-        liquidatedSide: 'ЛОНГІВ',
-        emoji: '🌊',
-        reason: 'падіння ціни'
-      };
-    } else {
-      return {
-        liquidatedSide: 'ШОРТІВ', 
-        emoji: '🔥',
-        reason: 'зростання ціни'
-      };
-    }
   }
 }
 
@@ -404,22 +334,22 @@ class CooldownManager {
 }
 
 // ============================================================================
-// ФОРМАТЕР АЛЕРТІВ
+// ФОРМАТЕР АЛЕРТІВ (оновлений)
 // ============================================================================
 
 class AlertFormatter {
   format(stats) {
     const lines = [];
     
-    const emoji = stats.dominantSide === 'LONG' ? '🔥' : '🌊';
-    const sideText = stats.dominantSide === 'LONG' ? 'ШОРТІВ' : 'ЛОНГІВ';
+    const emoji = stats.dominantSide === 'LONG' ? '🌊' : '🔥';
+    const sideText = stats.dominantSide === 'LONG' ? 'ЛОНГОВ' : 'ШОРТОВ';
     lines.push(`${emoji} ЛИКВИДАЦИЯ ${sideText}`);
     
     const volumeStr = this.formatVolume(stats.totalVolumeUSD);
     const durationStr = this.formatDuration(stats.durationSec);
-    lines.push(`Объем: ${volumeStr} (за ${durationStr})`);
+    lines.push(`Объем: $${volumeStr} (за ${durationStr})`);
     
-    const dominanceText = stats.dominantSide === 'LONG' ? 'ЛОНГІВ' : 'ШОРТІВ';
+    const dominanceText = stats.dominantSide === 'LONG' ? 'ЛОНГОВ' : 'ШОРТОВ';
     lines.push(`Доминирование: ${stats.dominance.toFixed(1)}% ${dominanceText}`);
     
     lines.push('————————————————————');
@@ -427,20 +357,17 @@ class AlertFormatter {
     const cleanSymbol = stats.symbol.replace('USDT', '');
     lines.push(`🔥 ${stats.symbol} #${cleanSymbol}`);
     
-    // НОВЕ: Додаємо зміну ціни
-    const priceChangeSign = stats.priceChange >= 0 ? '+' : '';
-    const priceEmoji = stats.priceChange >= 0 ? '📈' : '📉';
-    lines.push(`${priceEmoji} Зміна ціни: ${priceChangeSign}${stats.priceChange.toFixed(2)}%`);
-    
     const windowMin = Math.floor(stats.durationSec / 60);
     lines.push(`⏱️ Окно: ${windowMin} мин`);
     
-    lines.push(`📊 Кол-во ликвидаций: ${stats.count}`);
+    // 🆕 Зміна ціни
+    if (stats.priceChange) {
+      const sign = stats.priceChange.changePercent >= 0 ? '+' : '';
+      const priceEmoji = stats.priceChange.changePercent >= 0 ? '📈' : '📉';
+      lines.push(`${priceEmoji} Изменение цены: ${sign}${stats.priceChange.changePercent.toFixed(2)}%`);
+    }
     
-    // НОВЕ: Розбивка об'єму
-    lines.push(`💥 Агресивний об'єм:`);
-    lines.push(`   🟢 LONG: ${this.formatVolume(stats.longVolumeUSD)}`);
-    lines.push(`   🔴 SHORT: ${this.formatVolume(stats.shortVolumeUSD)}`);
+    lines.push(`📊 Кол-во ликвидаций: ${stats.count}`);
     
     return lines.join('\n');
   }
@@ -494,7 +421,7 @@ class TelegramNotifier {
 }
 
 // ============================================================================
-// WEBSOCKET МЕНЕДЖЕР (підписка тільки на валідні токени)
+// WEBSOCKET МЕНЕДЖЕР
 // ============================================================================
 
 class BinanceWebSocketManager {
@@ -542,7 +469,6 @@ class BinanceWebSocketManager {
     try {
       const message = JSON.parse(data);
       
-      // Binance надсилає об'єкт з полем "o" (order)
       if (!message.o) return;
 
       const order = message.o;
@@ -550,7 +476,7 @@ class BinanceWebSocketManager {
       
       this.processedCount++;
       
-      // КРИТИЧНО: Фільтрація по MCAP перед обробкою
+      // Фільтрація по MCAP + 24h Volume
       if (!this.tokenFilter.isValid(symbol)) {
         this.filteredCount++;
         return;
@@ -561,7 +487,6 @@ class BinanceWebSocketManager {
       const quantity = parseFloat(order.q);
       const volumeUSD = price * quantity;
 
-      // Додаємо в агрегатор (тільки валідні токени)
       this.aggregator.addLiquidation(symbol, {
         side,
         price,
@@ -571,7 +496,7 @@ class BinanceWebSocketManager {
       });
 
     } catch (error) {
-      // Мовчки ігноруємо помилки парсингу
+      // Мовчки ігноруємо
     }
   }
 
@@ -611,12 +536,11 @@ class BinanceWebSocketManager {
 // ============================================================================
 
 class AlertEngine {
-  constructor(aggregator, detector, cooldownManager, notifier, priceTracker) {
+  constructor(aggregator, detector, cooldownManager, notifier) {
     this.aggregator = aggregator;
     this.detector = detector;
     this.cooldownManager = cooldownManager;
     this.notifier = notifier;
-    this.priceTracker = priceTracker;
     this.checkInterval = null;
     this.statsInterval = null;
   }
@@ -628,7 +552,6 @@ class AlertEngine {
       this.checkAllWindows();
     }, CONFIG.CHECK_INTERVAL_SEC * 1000);
 
-    // Статистика фільтрації кожну хвилину
     this.statsInterval = setInterval(() => {
       if (wsManager) {
         const stats = wsManager.getStats();
@@ -641,35 +564,16 @@ class AlertEngine {
     const symbols = this.aggregator.getAllActiveSymbols();
     
     for (const symbol of symbols) {
-      // Отримуємо статистику з ціновими даними
-      const stats = this.aggregator.getWindowStats(symbol, this.priceTracker);
+      const stats = this.aggregator.getWindowStats(symbol);
       
       if (!stats) continue;
 
-      // DEBUG: Логуємо вікна що мають об'єм
-      if (stats.totalVolumeUSD >= CONFIG.MIN_LIQUIDATION_USD * 0.3) {
-        const domSide = stats.dominantSide === 'LONG' ? '🟢' : '🔴';
-        console.log(`[DEBUG] ${symbol.padEnd(12)} | ${domSide} ${(stats.totalVolumeUSD / 1000).toFixed(0)}K | Dom: ${stats.dominance.toFixed(0)}% | Price: ${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(2)}% | ${stats.durationSec.toFixed(0)}s`);
-      }
-
       if (!this.detector.shouldAlert(stats)) {
-        // DEBUG: Чому не пройшов
-        if (stats.totalVolumeUSD >= CONFIG.MIN_LIQUIDATION_USD * 0.5) {
-          const reasons = [];
-          if (stats.totalVolumeUSD < CONFIG.MIN_LIQUIDATION_USD) reasons.push(`vol<${CONFIG.MIN_LIQUIDATION_USD / 1e6}M`);
-          if (stats.dominance < CONFIG.MIN_DOMINANCE) reasons.push(`dom<${CONFIG.MIN_DOMINANCE}%`);
-          if (Math.abs(stats.priceChange) < CONFIG.MIN_PRICE_CHANGE_PERCENT) reasons.push(`price<${CONFIG.MIN_PRICE_CHANGE_PERCENT}%`);
-          if (stats.totalVolumeUSD < CONFIG.AGGRESSIVE_VOLUME_USD) reasons.push(`aggr<${CONFIG.AGGRESSIVE_VOLUME_USD / 1e6}M`);
-          if (reasons.length > 0) {
-            console.log(`[SKIP] ${symbol} - ${reasons.join(', ')}`);
-          }
-        }
         continue;
       }
 
       const signature = this.detector.getSignature(stats);
       if (!this.cooldownManager.canAlert(symbol, stats, signature)) {
-        console.log(`[COOLDOWN] ${symbol} - в cooldown`);
         continue;
       }
 
@@ -683,8 +587,11 @@ class AlertEngine {
       
       this.cooldownManager.recordAlert(symbol, signature);
       
-      const interpretation = this.detector.interpretSignal(stats);
-      console.log(`[🚨 ALERT] ${symbol} | ${interpretation.liquidatedSide} | ${(stats.totalVolumeUSD / 1e6).toFixed(2)}M | ${stats.dominance.toFixed(1)}% | Δ${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(2)}%`);
+      const priceInfo = stats.priceChange 
+        ? ` | Δ${stats.priceChange.changePercent.toFixed(2)}%`
+        : '';
+      
+      console.log(`[🚨 ALERT] ${symbol} | ${stats.dominantSide} | $${(stats.totalVolumeUSD / 1e6).toFixed(2)}M | ${stats.dominance.toFixed(1)}%${priceInfo}`);
       
       this.aggregator.reset(symbol);
       
@@ -710,8 +617,11 @@ class AlertEngine {
 class BinanceLiquidationBot {
   constructor() {
     this.tokenFilter = new TokenFilter(CONFIG.FILTER_CONFIG);
-    this.priceTracker = new PriceTracker();
-    this.aggregator = new LiquidationAggregator(CONFIG.AGGREGATION_WINDOW_SEC);
+    this.priceTracker = new PriceTracker(CONFIG.PRICE_CHANGE_WINDOW_SEC); // 🆕
+    this.aggregator = new LiquidationAggregator(
+      CONFIG.AGGREGATION_WINDOW_SEC,
+      this.priceTracker // 🆕
+    );
     this.detector = new SignalDetector();
     this.cooldownManager = new CooldownManager(
       CONFIG.COOLDOWN_MINUTES,
@@ -726,55 +636,47 @@ class BinanceLiquidationBot {
       this.aggregator,
       this.detector,
       this.cooldownManager,
-      this.notifier,
-      this.priceTracker
+      this.notifier
     );
-
-    // Слухаємо оновлення фільтра для переподписки
-    this.setupFilterUpdateListener();
-  }
-
-  setupFilterUpdateListener() {
-    // Оновлення фільтра не потребує переподписки (фільтрація на рівні обробки)
-    // Просто логуємо коли список оновлено
   }
 
   async start() {
     console.log('='.repeat(70));
-    console.log('BINANCE FUTURES LIQUIDATION ALERT BOT');
-    console.log('🎯 Глобальний стрім → Фільтрація по MCAP + Агресія');
+    console.log('BINANCE FUTURES LIQUIDATION ALERT BOT (ENHANCED)');
     console.log('='.repeat(70));
-    console.log(`Мін об'єм: ${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
-    console.log(`Мін домінування: ${CONFIG.MIN_DOMINANCE}%`);
-    console.log(`Агресивний об'єм: ${(CONFIG.AGGRESSIVE_VOLUME_USD / 1e6).toFixed(1)}M за ${CONFIG.AGGRESSIVE_VOLUME_WINDOW_SEC}с`);
-    console.log(`Мін зміна ціни: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}% за ${CONFIG.PRICE_CHANGE_WINDOW_SEC}с`);
-    console.log(`Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SEC}с`);
-    console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} хв`);
-    console.log('='.repeat(70));
-    console.log('ФІЛЬТР ТОКЕНІВ (MCAP):');
-    console.log(`  Діапазон: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_MCAP_USD)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_MCAP_USD)}`);
+    console.log('БАЗОВІ ПАРАМЕТРИ:');
+    console.log(`  Мін об\'єм ліквідацій: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
+    console.log(`  Мін домінування: ${CONFIG.MIN_DOMINANCE}%`);
+    console.log(`  Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SEC}с`);
+    console.log(`  Cooldown: ${CONFIG.COOLDOWN_MINUTES} хв`);
+    console.log('—'.repeat(70));
+    console.log('🆕 ФІЛЬТР ЗМІНИ ЦІНИ:');
+    console.log(`  Діапазон: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}% - ${CONFIG.MAX_PRICE_CHANGE_PERCENT}%`);
+    console.log(`  Вікно: ${CONFIG.PRICE_CHANGE_WINDOW_SEC}с (${(CONFIG.PRICE_CHANGE_WINDOW_SEC / 60).toFixed(1)}хв)`);
+    console.log('—'.repeat(70));
+    console.log('🆕 ФІЛЬТР ТОКЕНІВ:');
+    console.log(`  MCAP: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_MCAP_USD)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_MCAP_USD)}`);
+    console.log(`  24h Volume: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_VOLUME_24H)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_VOLUME_24H)}`);
     console.log(`  Оновлення: кожні ${CONFIG.FILTER_CONFIG.UPDATE_INTERVAL_HOURS}год`);
     console.log('='.repeat(70));
 
-    // Ініціалізація фільтра токенів
-    console.log('\n⏳ Аналіз токенів Binance Futures та їх Market Cap...');
+    console.log('\n⏳ Ініціалізація фільтру токенів...');
     await this.tokenFilter.initialize();
 
     const stats = this.tokenFilter.getStats();
     console.log('\n📊 ФІЛЬТРАЦІЯ ЗАВЕРШЕНА');
     console.log(`   Валідних токенів: ${stats.total}`);
-    console.log(`   Діапазон: ${stats.config.mcapRange}\n`);
+    console.log(`   MCAP: ${stats.config.mcapRange}`);
+    console.log(`   Volume: ${stats.config.volumeRange}\n`);
 
-    // Тест Telegram
     try {
       await this.notifier.sendStatus(
-        '🚀 Binance Liquidation Bot запущено\n\n' +
+        '🚀 Binance Liquidation Bot (Enhanced) запущено\n\n' +
         `✅ Валідних токенів: ${stats.total}\n` +
-        `✅ MCAP діапазон: ${stats.config.mcapRange}\n` +
-        `✅ Мін об\'єм: ${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M\n` +
-        `✅ Мін домінування: ${CONFIG.MIN_DOMINANCE}%\n` +
-        `🔥 Агресивний об\'єм: ${(CONFIG.AGGRESSIVE_VOLUME_USD / 1e6).toFixed(1)}M\n` +
-        `📈 Мін зміна ціни: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}%`
+        `✅ MCAP: ${stats.config.mcapRange}\n` +
+        `✅ 24h Volume: ${stats.config.volumeRange}\n` +
+        `✅ Зміна ціни: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}%-${CONFIG.MAX_PRICE_CHANGE_PERCENT}%\n` +
+        `✅ Мін об\'єм ліквідацій: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`
       );
       console.log('[TELEGRAM] ✅ Підключено\n');
     } catch (error) {
@@ -782,18 +684,9 @@ class BinanceLiquidationBot {
       process.exit(1);
     }
 
-    // Запуск WebSocket (глобальний стрім)
     this.wsManager.connect();
-
-    // Запуск відстеження цін
-    const validSymbols = this.tokenFilter.getValidTokens();
-    console.log(`[PRICE] Запуск відстеження цін для ${validSymbols.length} токенів...\n`);
-    this.priceTracker.connect(validSymbols);
-
-    // Запуск движка алертів
     this.alertEngine.start(this.wsManager);
 
-    // Обробники завершення
     process.on('SIGINT', () => this.shutdown());
     process.on('SIGTERM', () => this.shutdown());
   }
@@ -811,7 +704,6 @@ class BinanceLiquidationBot {
     this.alertEngine.stop();
     this.tokenFilter.stop();
     this.wsManager.close();
-    this.priceTracker.close();
     
     await this.notifier.sendStatus('⛔ Binance Liquidation Bot зупинено');
     
