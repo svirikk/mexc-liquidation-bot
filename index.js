@@ -29,6 +29,13 @@ const CONFIG = {
   MIN_LIQUIDATION_USD: parseInt(process.env.MIN_LIQUIDATION_USD) || 1_000_000,
   MIN_DOMINANCE: parseFloat(process.env.MIN_DOMINANCE) || 65.0,
   
+  // Додаткові фільтри агресії
+  MIN_PRICE_CHANGE_PERCENT: parseFloat(process.env.MIN_PRICE_CHANGE_PERCENT) || 3.0,
+  PRICE_CHANGE_WINDOW_SEC: parseInt(process.env.PRICE_CHANGE_WINDOW_SEC) || 180, // 3 хв
+  
+  AGGRESSIVE_VOLUME_USD: parseInt(process.env.AGGRESSIVE_VOLUME_USD) || 1_000_000,
+  AGGRESSIVE_VOLUME_WINDOW_SEC: parseInt(process.env.AGGRESSIVE_VOLUME_WINDOW_SEC) || 300, // 5 хв
+  
   // Часове вікно агрегації (секунди)
   AGGREGATION_WINDOW_SEC: parseInt(process.env.AGGREGATION_WINDOW_SEC) || 180,
   
