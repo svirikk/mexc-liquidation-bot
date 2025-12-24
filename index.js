@@ -61,7 +61,123 @@ const CONFIG = {
 };
 
 // ============================================================================
-// АГРЕГАТОР ЛІКВІДАЦІЙ
+// PRICE TRACKER (відстеження ціни в реальному часі)
+// ============================================================================
+
+class PriceTracker {
+  constructor() {
+    this.prices = new Map(); // symbol -> { price, timestamp, history: [] }
+    this.ws = null;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.reconnectDelay = 5000;
+  }
+
+  connect(symbols) {
+    console.log('[PRICE] 📊 Підключення до ticker stream...');
+    
+    // Підписуємося на міні-тікери для всіх символів
+    const streams = symbols.slice(0, 200).map(s => `${s.toLowerCase()}@miniTicker`);
+    const wsUrl = `wss://fstream.binance.com/stream?streams=${streams.join('/')}`;
+    
+    this.ws = new WebSocket(wsUrl);
+
+    this.ws.on('open', () => {
+      console.log(`[PRICE] ✅ Підключено (${symbols.length} символів)`);
+      this.reconnectAttempts = 0;
+    });
+
+    this.ws.on('message', (data) => {
+      try {
+        const message = JSON.parse(data);
+        if (message.data && message.data.s && message.data.c) {
+          const symbol = message.data.s;
+          const price = parseFloat(message.data.c);
+          const timestamp = Date.now();
+
+          if (!this.prices.has(symbol)) {
+            this.prices.set(symbol, {
+              price,
+              timestamp,
+              history: [{ price, timestamp }]
+            });
+          } else {
+            const tracker = this.prices.get(symbol);
+            tracker.price = price;
+            tracker.timestamp = timestamp;
+            tracker.history.push({ price, timestamp });
+            
+            // Зберігаємо історію тільки за останні 10 хвилин
+            const cutoff = timestamp - 600000;
+            tracker.history = tracker.history.filter(h => h.timestamp > cutoff);
+          }
+        }
+      } catch (error) {
+        // Ігноруємо помилки парсингу
+      }
+    });
+
+    this.ws.on('error', (error) => {
+      console.error('[PRICE] Помилка:', error.message);
+    });
+
+    this.ws.on('close', () => {
+      console.log('[PRICE] З\'єднання закрито');
+      this.reconnect(symbols);
+    });
+  }
+
+  reconnect(symbols) {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('[PRICE] Досягнуто максимум спроб переподключення');
+      return;
+    }
+
+    this.reconnectAttempts++;
+    console.log(`[PRICE] Переподключення через ${this.reconnectDelay / 1000}с...`);
+    
+    setTimeout(() => {
+      this.connect(symbols);
+    }, this.reconnectDelay);
+  }
+
+  getCurrentPrice(symbol) {
+    const tracker = this.prices.get(symbol);
+    return tracker ? tracker.price : null;
+  }
+
+  getPriceChange(symbol, windowMs) {
+    const tracker = this.prices.get(symbol);
+    if (!tracker || tracker.history.length < 2) return null;
+
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    
+    // Знаходимо найстарішу ціну в вікні
+    const oldPrices = tracker.history.filter(h => h.timestamp >= cutoff);
+    if (oldPrices.length === 0) return null;
+
+    const oldestPrice = oldPrices[0].price;
+    const currentPrice = tracker.price;
+    
+    const priceChange = ((currentPrice - oldestPrice) / oldestPrice) * 100;
+    
+    return {
+      startPrice: oldestPrice,
+      currentPrice,
+      priceChange
+    };
+  }
+
+  close() {
+    if (this.ws) {
+      this.ws.close();
+    }
+  }
+}
+
+// ============================================================================
+// АГРЕГАТОР ЛІКВІДАЦІЙ (спрощений - без відстеження ціни)
 // ============================================================================
 
 class LiquidationAggregator {
@@ -74,15 +190,12 @@ class LiquidationAggregator {
     if (!this.windows.has(symbol)) {
       this.windows.set(symbol, {
         liquidations: [],
-        startTime: Date.now(),
-        startPrice: liquidation.price,
-        lastPrice: liquidation.price
+        startTime: Date.now()
       });
     }
 
     const window = this.windows.get(symbol);
     window.liquidations.push(liquidation);
-    window.lastPrice = liquidation.price; // Оновлюємо останню ціну
     
     this.cleanup(symbol);
   }
@@ -104,7 +217,7 @@ class LiquidationAggregator {
     }
   }
 
-  getWindowStats(symbol) {
+  getWindowStats(symbol, priceTracker) {
     if (!this.windows.has(symbol)) return null;
 
     const window = this.windows.get(symbol);
@@ -133,8 +246,13 @@ class LiquidationAggregator {
     const now = Date.now();
     const durationSec = (now - window.startTime) / 1000;
 
-    // Розраховуємо зміну ціни
-    const priceChange = ((window.lastPrice - window.startPrice) / window.startPrice) * 100;
+    // Отримуємо зміну ціни з PriceTracker
+    const windowMs = this.windowMs;
+    const priceData = priceTracker ? priceTracker.getPriceChange(symbol, windowMs) : null;
+    
+    const priceChange = priceData ? priceData.priceChange : 0;
+    const startPrice = priceData ? priceData.startPrice : 0;
+    const currentPrice = priceData ? priceData.currentPrice : 0;
 
     return {
       symbol,
@@ -148,8 +266,8 @@ class LiquidationAggregator {
       count: window.liquidations.length,
       durationSec,
       timestamp: now,
-      startPrice: window.startPrice,
-      lastPrice: window.lastPrice,
+      startPrice,
+      lastPrice: currentPrice,
       priceChange
     };
   }
@@ -493,11 +611,12 @@ class BinanceWebSocketManager {
 // ============================================================================
 
 class AlertEngine {
-  constructor(aggregator, detector, cooldownManager, notifier) {
+  constructor(aggregator, detector, cooldownManager, notifier, priceTracker) {
     this.aggregator = aggregator;
     this.detector = detector;
     this.cooldownManager = cooldownManager;
     this.notifier = notifier;
+    this.priceTracker = priceTracker;
     this.checkInterval = null;
     this.statsInterval = null;
   }
@@ -522,16 +641,35 @@ class AlertEngine {
     const symbols = this.aggregator.getAllActiveSymbols();
     
     for (const symbol of symbols) {
-      const stats = this.aggregator.getWindowStats(symbol);
+      // Отримуємо статистику з ціновими даними
+      const stats = this.aggregator.getWindowStats(symbol, this.priceTracker);
       
       if (!stats) continue;
 
+      // DEBUG: Логуємо вікна що мають об'єм
+      if (stats.totalVolumeUSD >= CONFIG.MIN_LIQUIDATION_USD * 0.3) {
+        const domSide = stats.dominantSide === 'LONG' ? '🟢' : '🔴';
+        console.log(`[DEBUG] ${symbol.padEnd(12)} | ${domSide} ${(stats.totalVolumeUSD / 1000).toFixed(0)}K | Dom: ${stats.dominance.toFixed(0)}% | Price: ${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(2)}% | ${stats.durationSec.toFixed(0)}s`);
+      }
+
       if (!this.detector.shouldAlert(stats)) {
+        // DEBUG: Чому не пройшов
+        if (stats.totalVolumeUSD >= CONFIG.MIN_LIQUIDATION_USD * 0.5) {
+          const reasons = [];
+          if (stats.totalVolumeUSD < CONFIG.MIN_LIQUIDATION_USD) reasons.push(`vol<${CONFIG.MIN_LIQUIDATION_USD / 1e6}M`);
+          if (stats.dominance < CONFIG.MIN_DOMINANCE) reasons.push(`dom<${CONFIG.MIN_DOMINANCE}%`);
+          if (Math.abs(stats.priceChange) < CONFIG.MIN_PRICE_CHANGE_PERCENT) reasons.push(`price<${CONFIG.MIN_PRICE_CHANGE_PERCENT}%`);
+          if (stats.totalVolumeUSD < CONFIG.AGGRESSIVE_VOLUME_USD) reasons.push(`aggr<${CONFIG.AGGRESSIVE_VOLUME_USD / 1e6}M`);
+          if (reasons.length > 0) {
+            console.log(`[SKIP] ${symbol} - ${reasons.join(', ')}`);
+          }
+        }
         continue;
       }
 
       const signature = this.detector.getSignature(stats);
       if (!this.cooldownManager.canAlert(symbol, stats, signature)) {
+        console.log(`[COOLDOWN] ${symbol} - в cooldown`);
         continue;
       }
 
@@ -572,6 +710,7 @@ class AlertEngine {
 class BinanceLiquidationBot {
   constructor() {
     this.tokenFilter = new TokenFilter(CONFIG.FILTER_CONFIG);
+    this.priceTracker = new PriceTracker();
     this.aggregator = new LiquidationAggregator(CONFIG.AGGREGATION_WINDOW_SEC);
     this.detector = new SignalDetector();
     this.cooldownManager = new CooldownManager(
@@ -587,7 +726,8 @@ class BinanceLiquidationBot {
       this.aggregator,
       this.detector,
       this.cooldownManager,
-      this.notifier
+      this.notifier,
+      this.priceTracker
     );
 
     // Слухаємо оновлення фільтра для переподписки
@@ -645,6 +785,11 @@ class BinanceLiquidationBot {
     // Запуск WebSocket (глобальний стрім)
     this.wsManager.connect();
 
+    // Запуск відстеження цін
+    const validSymbols = this.tokenFilter.getValidTokens();
+    console.log(`[PRICE] Запуск відстеження цін для ${validSymbols.length} токенів...\n`);
+    this.priceTracker.connect(validSymbols);
+
     // Запуск движка алертів
     this.alertEngine.start(this.wsManager);
 
@@ -666,6 +811,7 @@ class BinanceLiquidationBot {
     this.alertEngine.stop();
     this.tokenFilter.stop();
     this.wsManager.close();
+    this.priceTracker.close();
     
     await this.notifier.sendStatus('⛔ Binance Liquidation Bot зупинено');
     
