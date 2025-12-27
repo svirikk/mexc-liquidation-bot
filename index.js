@@ -2,6 +2,7 @@
 // BINANCE FUTURES LIQUIDATION ALERT BOT (ENHANCED)
 // Моніторинг масових ліквідацій для reversal-трейдингу
 // + Фільтр зміни ціни + Фільтр 24h volume
+// + ЛОГІКА З BYBIT БОТА: Об'єм домінуючої сторони
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -224,46 +225,63 @@ class LiquidationAggregator {
 }
 
 // ============================================================================
-// ДЕТЕКТОР СИГНАЛІВ (модифікований)
+// ДЕТЕКТОР СИГНАЛІВ
+// 🔥 ДОДАНО ЛОГІКУ З BYBIT БОТА: Перевірка об'єму домінуючої сторони
 // ============================================================================
 
 class SignalDetector {
   shouldAlert(stats) {
     if (!stats) return false;
 
-    // Перевірка мінімального об'єму ліквідацій
+    // ========================================================================
+    // ФІЛЬТР 1: ЗАГАЛЬНИЙ ОБ'ЄМ ЛІКВІДАЦІЙ (БАЗОВИЙ)
+    // ========================================================================
     if (stats.totalVolumeUSD < CONFIG.MIN_LIQUIDATION_USD) {
       return false;
     }
 
-    // Перевірка домінування
+    // ========================================================================
+    // ФІЛЬТР 2: ДОМІНУВАННЯ (БАЗОВИЙ)
+    // ========================================================================
     if (stats.dominance < CONFIG.MIN_DOMINANCE) {
       return false;
     }
 
-    // 🆕 ПЕРЕВІРКА ЗМІНИ ЦІНИ
+    // ========================================================================
+    // ФІЛЬТР 3: 🔥 ДОДАТКОВИЙ З BYBIT - ОБ'ЄМ ДОМІНУЮЧОЇ СТОРОНИ
+    // ========================================================================
+    // Додаткова перевірка: окремо перевіряємо об'єм саме тієї сторони що домінує
+    // Це відсіює випадки коли загальний об'єм великий, але немає чіткого напрямку
+    const dominantVolumeUSD = stats.dominantSide === 'LONG' 
+      ? stats.longVolumeUSD 
+      : stats.shortVolumeUSD;
+    
+    // Домінуюча сторона має мати мінімум 80% від порогу
+    // Приклад: якщо MIN_LIQUIDATION_USD = $1M, то домінуюча >= $800K
+    const dominantThreshold = CONFIG.MIN_LIQUIDATION_USD * 0.8;
+    if (dominantVolumeUSD < dominantThreshold) {
+      return false;
+    }
+
+    // ========================================================================
+    // ФІЛЬТР 4: ЗМІНА ЦІНИ
+    // ========================================================================
     if (stats.priceChange) {
       const absChange = Math.abs(stats.priceChange.changePercent);
       
-      // Ціна має змінитися в діапазоні MIN_PRICE_CHANGE_PERCENT - MAX_PRICE_CHANGE_PERCENT
       if (absChange < CONFIG.MIN_PRICE_CHANGE_PERCENT) {
         return false;
       }
 
       if (absChange > CONFIG.MAX_PRICE_CHANGE_PERCENT) {
-        // Занадто велика зміна - можливо помилка або маніпуляція
         return false;
       }
 
-      // Напрямок зміни ціни має відповідати домінуванню:
-      // Якщо ліквідуються LONG позиції → ціна падає (негативна зміна)
-      // Якщо ліквідуються SHORT позиції → ціна росте (позитивна зміна)
+      // Напрямок ціни має відповідати домінуванню
       if (stats.dominantSide === 'LONG' && stats.priceChange.changePercent > 0) {
-        // Ліквідація лонгів, але ціна росте - підозріло
         return false;
       }
       if (stats.dominantSide === 'SHORT' && stats.priceChange.changePercent < 0) {
-        // Ліквідація шортів, але ціна падає - підозріло
         return false;
       }
     }
@@ -272,7 +290,12 @@ class SignalDetector {
   }
 
   getSignature(stats) {
-    return `${stats.symbol}:${stats.dominantSide}:${Math.floor(stats.totalVolumeUSD / 100000)}`;
+    // 🔥 BYBIT ЛОГІКА: Використовуємо домінуючий об'єм для signature
+    const dominantVolumeUSD = stats.dominantSide === 'LONG' 
+      ? stats.longVolumeUSD 
+      : stats.shortVolumeUSD;
+    
+    return `${stats.symbol}:${stats.dominantSide}:${Math.floor(dominantVolumeUSD / 100000)}`;
   }
 }
 
@@ -334,7 +357,8 @@ class CooldownManager {
 }
 
 // ============================================================================
-// ФОРМАТЕР АЛЕРТІВ (оновлений)
+// ФОРМАТЕР АЛЕРТІВ
+// 🔥 ДОДАНО: Показ об'єму домінуючої сторони (як в Bybit боті)
 // ============================================================================
 
 class AlertFormatter {
@@ -345,9 +369,10 @@ class AlertFormatter {
     const sideText = stats.dominantSide === 'LONG' ? 'ЛОНГОВ' : 'ШОРТОВ';
     lines.push(`${emoji} ЛИКВИДАЦИЯ ${sideText}`);
     
+    // Показуємо ЗАГАЛЬНИЙ об'єм (як було)
     const volumeStr = this.formatVolume(stats.totalVolumeUSD);
     const durationStr = this.formatDuration(stats.durationSec);
-    lines.push(`Объем: $${volumeStr} (за ${durationStr})`);
+    lines.push(`Объем: ${volumeStr} (за ${durationStr})`);
     
     const dominanceText = stats.dominantSide === 'LONG' ? 'ЛОНГОВ' : 'ШОРТОВ';
     lines.push(`Доминирование: ${stats.dominance.toFixed(1)}% ${dominanceText}`);
@@ -360,7 +385,7 @@ class AlertFormatter {
     const windowMin = Math.floor(stats.durationSec / 60);
     lines.push(`⏱️ Окно: ${windowMin} мин`);
     
-    // 🆕 Зміна ціни
+    // Зміна ціни
     if (stats.priceChange) {
       const sign = stats.priceChange.changePercent >= 0 ? '+' : '';
       const priceEmoji = stats.priceChange.changePercent >= 0 ? '📈' : '📉';
@@ -368,6 +393,11 @@ class AlertFormatter {
     }
     
     lines.push(`📊 Кол-во ликвидаций: ${stats.count}`);
+    
+    // Детальна розбивка об'єму
+    lines.push(`💥 Агресивний об'єм:`);
+    lines.push(`   🔴 Продаж (LONG ліквідації): ${this.formatVolume(stats.longVolumeUSD)}`);
+    lines.push(`   🟢 Покупка (SHORT ліквідації): ${this.formatVolume(stats.shortVolumeUSD)}`);
     
     return lines.join('\n');
   }
@@ -533,6 +563,7 @@ class BinanceWebSocketManager {
 
 // ============================================================================
 // ALERT ENGINE
+// 🔥 ДОДАНО: Логування об'єму домінуючої сторони
 // ============================================================================
 
 class AlertEngine {
@@ -568,12 +599,51 @@ class AlertEngine {
       
       if (!stats) continue;
 
+      // DEBUG: Показуємо великі вікна
+      const dominantVolumeUSD = stats.dominantSide === 'LONG' 
+        ? stats.longVolumeUSD 
+        : stats.shortVolumeUSD;
+      
+      if (stats.totalVolumeUSD >= CONFIG.MIN_LIQUIDATION_USD * 0.3) {
+        const domSide = stats.dominantSide === 'LONG' ? '🔴 LONG' : '🟢 SHORT';
+        const priceSign = stats.priceChange ? (stats.priceChange.changePercent >= 0 ? '+' : '') : '';
+        const priceStr = stats.priceChange ? `${priceSign}${stats.priceChange.changePercent.toFixed(2)}%` : 'N/A';
+        
+        console.log(
+          `[DEBUG] ${symbol.padEnd(12)} | ${domSide.padEnd(10)} | ` +
+          `Total: ${(stats.totalVolumeUSD / 1000).toFixed(0)}K | ` +
+          `Dom: ${(dominantVolumeUSD / 1000).toFixed(0)}K (${stats.dominance.toFixed(0)}%) | ` +
+          `Price: ${priceStr} | ${stats.durationSec.toFixed(0)}s`
+        );
+      }
+
       if (!this.detector.shouldAlert(stats)) {
+        // DEBUG: Чому не пройшов
+        if (stats.totalVolumeUSD >= CONFIG.MIN_LIQUIDATION_USD * 0.5) {
+          const reasons = [];
+          if (stats.totalVolumeUSD < CONFIG.MIN_LIQUIDATION_USD) {
+            reasons.push(`total<${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
+          }
+          if (stats.dominance < CONFIG.MIN_DOMINANCE) {
+            reasons.push(`dom<${CONFIG.MIN_DOMINANCE}%`);
+          }
+          const dominantThreshold = CONFIG.MIN_LIQUIDATION_USD * 0.8;
+          if (dominantVolumeUSD < dominantThreshold) {
+            reasons.push(`domSide<${(dominantThreshold / 1e6).toFixed(1)}M`);
+          }
+          if (stats.priceChange && Math.abs(stats.priceChange.changePercent) < CONFIG.MIN_PRICE_CHANGE_PERCENT) {
+            reasons.push(`price<${CONFIG.MIN_PRICE_CHANGE_PERCENT}%`);
+          }
+          if (reasons.length > 0) {
+            console.log(`[SKIP] ${symbol} - ${reasons.join(', ')}`);
+          }
+        }
         continue;
       }
 
       const signature = this.detector.getSignature(stats);
       if (!this.cooldownManager.canAlert(symbol, stats, signature)) {
+        console.log(`[COOLDOWN] ${symbol} - в cooldown`);
         continue;
       }
 
@@ -587,11 +657,20 @@ class AlertEngine {
       
       this.cooldownManager.recordAlert(symbol, signature);
       
+      // 🔥 BYBIT СТИЛЬ: Логуємо об'єм домінуючої сторони
+      const dominantVolumeUSD = stats.dominantSide === 'LONG' 
+        ? stats.longVolumeUSD 
+        : stats.shortVolumeUSD;
+      
       const priceInfo = stats.priceChange 
-        ? ` | Δ${stats.priceChange.changePercent.toFixed(2)}%`
+        ? ` | Δ${stats.priceChange.changePercent >= 0 ? '+' : ''}${stats.priceChange.changePercent.toFixed(2)}%`
         : '';
       
-      console.log(`[🚨 ALERT] ${symbol} | ${stats.dominantSide} | $${(stats.totalVolumeUSD / 1e6).toFixed(2)}M | ${stats.dominance.toFixed(1)}%${priceInfo}`);
+      console.log(
+        `[🚨 ALERT] ${symbol} | ${stats.dominantSide} | ` +
+        `$${(dominantVolumeUSD / 1e6).toFixed(2)}M | ` +
+        `${stats.dominance.toFixed(1)}%${priceInfo}`
+      );
       
       this.aggregator.reset(symbol);
       
@@ -644,20 +723,21 @@ class BinanceLiquidationBot {
     console.log('='.repeat(70));
     console.log('BINANCE FUTURES LIQUIDATION ALERT BOT (ENHANCED)');
     console.log('='.repeat(70));
-    console.log('БАЗОВІ ПАРАМЕТРИ:');
-    console.log(`  Мін об\'єм ліквідацій: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
-    console.log(`  Мін домінування: ${CONFIG.MIN_DOMINANCE}%`);
+    console.log('ФІЛЬТРИ ЛІКВІДАЦІЙ (ВСІ МАЮ ВИКОНАТИСЬ):');
+    console.log(`  1️⃣ Загальний об\'єм >= ${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`);
+    console.log(`  2️⃣ Домінування >= ${CONFIG.MIN_DOMINANCE}%`);
+    console.log(`  3️⃣ Об\'єм домінуючої сторони >= ${(CONFIG.MIN_LIQUIDATION_USD * 0.8 / 1e6).toFixed(1)}M (80%)`);
+    console.log(`  4️⃣ Зміна ціни: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}%-${CONFIG.MAX_PRICE_CHANGE_PERCENT}%`);
+    console.log(`  5️⃣ Напрямок ціни відповідає ліквідації`);
+    console.log('—'.repeat(70));
+    console.log('ФІЛЬТР ТОКЕНІВ:');
+    console.log(`  MCAP: ${this.formatNum(CONFIG.FILTER_CONFIG.MIN_MCAP_USD)} - ${this.formatNum(CONFIG.FILTER_CONFIG.MAX_MCAP_USD)}`);
+    console.log(`  24h Volume: ${this.formatNum(CONFIG.FILTER_CONFIG.MIN_VOLUME_24H)} - ${this.formatNum(CONFIG.FILTER_CONFIG.MAX_VOLUME_24H)}`);
+    console.log('—'.repeat(70));
+    console.log('ПАРАМЕТРИ:');
     console.log(`  Вікно агрегації: ${CONFIG.AGGREGATION_WINDOW_SEC}с`);
+    console.log(`  Вікно зміни ціни: ${CONFIG.PRICE_CHANGE_WINDOW_SEC}с`);
     console.log(`  Cooldown: ${CONFIG.COOLDOWN_MINUTES} хв`);
-    console.log('—'.repeat(70));
-    console.log('🆕 ФІЛЬТР ЗМІНИ ЦІНИ:');
-    console.log(`  Діапазон: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}% - ${CONFIG.MAX_PRICE_CHANGE_PERCENT}%`);
-    console.log(`  Вікно: ${CONFIG.PRICE_CHANGE_WINDOW_SEC}с (${(CONFIG.PRICE_CHANGE_WINDOW_SEC / 60).toFixed(1)}хв)`);
-    console.log('—'.repeat(70));
-    console.log('🆕 ФІЛЬТР ТОКЕНІВ:');
-    console.log(`  MCAP: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_MCAP_USD)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_MCAP_USD)}`);
-    console.log(`  24h Volume: $${this.formatNum(CONFIG.FILTER_CONFIG.MIN_VOLUME_24H)} - $${this.formatNum(CONFIG.FILTER_CONFIG.MAX_VOLUME_24H)}`);
-    console.log(`  Оновлення: кожні ${CONFIG.FILTER_CONFIG.UPDATE_INTERVAL_HOURS}год`);
     console.log('='.repeat(70));
 
     console.log('\n⏳ Ініціалізація фільтру токенів...');
@@ -674,9 +754,12 @@ class BinanceLiquidationBot {
         '🚀 Binance Liquidation Bot (Enhanced) запущено\n\n' +
         `✅ Валідних токенів: ${stats.total}\n` +
         `✅ MCAP: ${stats.config.mcapRange}\n` +
-        `✅ 24h Volume: ${stats.config.volumeRange}\n` +
-        `✅ Зміна ціни: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}%-${CONFIG.MAX_PRICE_CHANGE_PERCENT}%\n` +
-        `✅ Мін об\'єм ліквідацій: $${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M`
+        `✅ 24h Volume: ${stats.config.volumeRange}\n\n` +
+        `ФІЛЬТРИ ЛІКВІДАЦІЙ:\n` +
+        `💰 Загальний об\'єм >= ${(CONFIG.MIN_LIQUIDATION_USD / 1e6).toFixed(1)}M\n` +
+        `📊 Домінування >= ${CONFIG.MIN_DOMINANCE}%\n` +
+        `🔥 Домінуюча сторона >= ${(CONFIG.MIN_LIQUIDATION_USD * 0.8 / 1e6).toFixed(1)}M\n` +
+        `📈 Зміна ціни: ${CONFIG.MIN_PRICE_CHANGE_PERCENT}%-${CONFIG.MAX_PRICE_CHANGE_PERCENT}%`
       );
       console.log('[TELEGRAM] ✅ Підключено\n');
     } catch (error) {
